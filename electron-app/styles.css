@@ -660,6 +660,88 @@ body {
     z-index: 100;
 }
 
+/* ============================================
+   Grid Outline Flyout
+   ============================================ */
+
+.grid-outline-flyout {
+    position: fixed;
+    top: calc(var(--header-height) + 16px);
+    right: 24px;
+    width: 320px;
+    max-height: calc(100vh - var(--header-height) - 32px);
+    background: var(--bg-primary);
+    border: 1px solid var(--border-color);
+    border-radius: var(--radius-lg);
+    box-shadow: 0 12px 32px rgba(0,0,0,0.14);
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+    z-index: 120;
+}
+
+.grid-outline-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border-color);
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--text-secondary);
+}
+
+.grid-outline-title {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.grid-outline-body {
+    flex: 1;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 8px 0;
+}
+
+.grid-outline-flyout .outline-item {
+    padding-right: 14px;
+}
+
+.grid-outline-actions {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.grid-outline-action {
+    border: none;
+    background: var(--accent-light);
+    color: var(--accent);
+    padding: 4px 8px;
+    border-radius: 6px;
+    cursor: pointer;
+    transition: all 0.12s ease;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+}
+
+.grid-outline-action:hover {
+    background: var(--accent);
+    color: white;
+}
+
+.grid-outline-action svg {
+    width: 14px;
+    height: 14px;
+}
+
+.grid-outline-flyout[hidden] {
+    display: none;
+}
+
 .selection-toggle {
     width: 32px;
     height: 32px;

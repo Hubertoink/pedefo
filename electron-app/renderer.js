@@ -220,7 +220,13 @@ function attachGridScrollHandler() {
     if (gridScrollHandlerAttached) return;
     const container = document.getElementById('pages-container');
     if (!container) return;
-    container.addEventListener('scroll', () => scheduleGridThumbnailLoad());
+    container.addEventListener('scroll', () => {
+        scheduleGridThumbnailLoad();
+        if (gridOutlineOpen) {
+            const activeIndex = getActiveGridPageIndex();
+            if (activeIndex !== -1) highlightGridOutlineForPage(activeIndex);
+        }
+    });
     gridScrollHandlerAttached = true;
 }
 
@@ -389,6 +395,10 @@ function renderPages() {
     
     updateSelectionBar();
     updateSplitIndicators();
+
+    if (gridOutlineOpen) {
+        renderGridOutlineFlyout();
+    }
 }
 
 function createPageCard(page, index) {
@@ -1195,6 +1205,7 @@ function newFile() {
     if (document.getElementById('page-viewer').style.display === 'flex') {
         closePageViewer();
     }
+    toggleGridOutlineFlyout(false);
     
     state.currentFile = null;
     state.pages = [];
@@ -1221,9 +1232,13 @@ let readerThumbLoading = new Set(); // currently loading reader thumbs
 let readerThumbLoadScheduled = false;
 let readerThumbScrollAttached = false;
 let outlineCache = {};             // Cache: { sourceFile: outline[] }
+let gridOutlineOpen = false;
 
 async function openReaderView(startPageIndex = 0) {
     readerCurrentPage = startPageIndex;
+
+    // Grid-Flyout schließen, damit der Reader sauber sichtbar ist
+    toggleGridOutlineFlyout(false);
     
     // Thumbnails für die Sidebar rendern
     renderReaderThumbnails();
@@ -1522,6 +1537,190 @@ function renderOutlinePanel() {
     } else {
         highlightOutlineForPage(readerCurrentPage);
     }
+}
+
+function renderGridOutlineFlyout() {
+    const body = document.getElementById('grid-outline-body');
+    if (!body) return;
+
+    body.innerHTML = '';
+    const placeholder = document.createElement('div');
+    placeholder.className = 'reader-outline-empty';
+    placeholder.textContent = 'Kein Inhaltsverzeichnis gefunden';
+
+    const files = Array.from(new Set(state.pages.map(p => p.sourceFile)));
+    const multipleSources = files.length > 1;
+    let hasEntries = false;
+
+    files.forEach((filePath) => {
+        const outline = outlineCache[filePath];
+        if (!outline || outline.length === 0) return;
+        hasEntries = true;
+
+        if (multipleSources) {
+            const sourceLabel = document.createElement('div');
+            sourceLabel.className = 'reader-outline-source';
+            sourceLabel.textContent = getBaseName(filePath);
+            body.appendChild(sourceLabel);
+        }
+
+        const maxPage = getMaxPageForSource(filePath);
+        const rangeMap = computeOutlineRanges(outline, maxPage);
+        appendGridOutlineItems(outline, filePath, body, 0, rangeMap);
+    });
+
+    if (!hasEntries) {
+        body.appendChild(placeholder);
+    } else {
+        const activeIndex = getActiveGridPageIndex();
+        if (activeIndex !== -1) {
+            highlightGridOutlineForPage(activeIndex);
+        }
+    }
+}
+
+function appendGridOutlineItems(entries, sourceFile, container, depth, rangeMap) {
+    entries.forEach((entry) => {
+        const item = document.createElement('div');
+        item.className = 'outline-item';
+        item.style.paddingLeft = `${12 + depth * 14}px`;
+        item.dataset.sourceFile = sourceFile;
+
+        const range = rangeMap.get(entry) || null;
+        const startPage = range ? range.start : parseOutlinePageNumber(entry.page);
+        const endPage = range ? range.end : startPage;
+
+        const titleSpan = document.createElement('span');
+        titleSpan.className = 'outline-title';
+        titleSpan.textContent = entry.title || 'Ohne Titel';
+
+        const pageSpan = document.createElement('span');
+        pageSpan.className = 'outline-page';
+        if (startPage !== null) {
+            const rangeText = endPage !== null && endPage !== startPage
+                ? `S. ${startPage}-${endPage}`
+                : `S. ${startPage}`;
+            pageSpan.textContent = rangeText;
+            item.dataset.rangeStart = startPage;
+            item.dataset.rangeEnd = endPage;
+        } else {
+            pageSpan.textContent = '';
+        }
+
+        const actions = document.createElement('div');
+        actions.className = 'grid-outline-actions';
+        const exportBtn = document.createElement('button');
+        exportBtn.className = 'grid-outline-action';
+        exportBtn.title = 'Kapitel exportieren';
+        exportBtn.innerHTML = `
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <path d="M12 5v10" />
+                <path d="M7 10l5 5 5-5" />
+                <rect x="5" y="17" width="14" height="2" rx="1" />
+            </svg>
+        `;
+        exportBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            extractGridOutlineChapter(sourceFile, startPage, entry.title, endPage);
+        });
+        actions.appendChild(exportBtn);
+
+        const targetIndex = findPageIndexForOutline(sourceFile, startPage);
+        if (targetIndex === -1) {
+            item.classList.add('disabled');
+        } else {
+            item.dataset.targetIndex = targetIndex;
+            item.addEventListener('click', () => {
+                scrollGridToPage(targetIndex);
+                highlightGridOutlineForPage(targetIndex);
+            });
+        }
+
+        item.appendChild(titleSpan);
+        item.appendChild(pageSpan);
+        item.appendChild(actions);
+        container.appendChild(item);
+
+        if (entry.children && entry.children.length > 0) {
+            appendGridOutlineItems(entry.children, sourceFile, container, depth + 1, rangeMap);
+        }
+    });
+}
+
+function getActiveGridPageIndex() {
+    if (state.selectedPages.size > 0) {
+        const firstSelected = Array.from(state.selectedPages)[0];
+        const selIdx = state.pages.findIndex(p => p.id === firstSelected);
+        if (selIdx !== -1) return selIdx;
+    }
+    const visible = getVisiblePagesInGrid();
+    if (visible.length > 0) return visible[0].index;
+    return state.pages.length > 0 ? 0 : -1;
+}
+
+function highlightGridOutlineForPage(pageIndex) {
+    const page = state.pages[pageIndex];
+    if (!page) return;
+
+    let activeItem = null;
+    document.querySelectorAll('#grid-outline-flyout .outline-item').forEach((item) => {
+        const sourceMatches = item.dataset.sourceFile === page.sourceFile;
+        const start = parseInt(item.dataset.rangeStart, 10);
+        const end = parseInt(item.dataset.rangeEnd, 10);
+        const inRange = sourceMatches && !Number.isNaN(start) && !Number.isNaN(end) &&
+            page.originalNumber >= start && page.originalNumber <= end;
+
+        item.classList.toggle('active', inRange);
+        if (inRange) activeItem = item;
+    });
+
+    if (!activeItem) {
+        document.querySelectorAll('#grid-outline-flyout .outline-item').forEach((item) => {
+            const idx = parseInt(item.dataset.targetIndex, 10);
+            const isActive = Number.isInteger(idx) && idx === pageIndex;
+            item.classList.toggle('active', isActive);
+            if (isActive) activeItem = item;
+        });
+    }
+
+    if (activeItem) {
+        activeItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+}
+
+function scrollGridToPage(pageIndex) {
+    const page = state.pages[pageIndex];
+    if (!page) return;
+    const card = document.querySelector(`.page-card[data-page-id="${page.id}"]`);
+    const container = document.getElementById('pages-container');
+    if (!card || !container) return;
+
+    state.selectedPages.clear();
+    state.selectedPages.add(page.id);
+    updatePageSelectionUI();
+    updateSelectionBar();
+
+    const targetTop = card.offsetTop - container.clientHeight / 2 + card.clientHeight / 2;
+    container.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
+}
+
+async function toggleGridOutlineFlyout(showExplicit) {
+    const flyout = document.getElementById('grid-outline-flyout');
+    if (!flyout) return;
+    const shouldShow = typeof showExplicit === 'boolean' ? showExplicit : flyout.hidden;
+
+    if (!shouldShow) {
+        flyout.hidden = true;
+        gridOutlineOpen = false;
+        return;
+    }
+
+    if (!state.pages.length) return;
+
+    await loadOutlineForSources();
+    renderGridOutlineFlyout();
+    flyout.hidden = false;
+    gridOutlineOpen = true;
 }
 
 function appendOutlineItems(entries, sourceFile, container, depth, rangeMap) {
@@ -2084,7 +2283,15 @@ function appendViewerOutlineItems(items, sourceFile, container, depth, rangeMap)
 }
 
 async function extractOutlineChapter(sourceFile, startPage, title, endPage) {
-    const outline = viewerOutlineCache[sourceFile];
+    await extractOutlineChapterGeneric(viewerOutlineCache, sourceFile, startPage, title, endPage);
+}
+
+async function extractGridOutlineChapter(sourceFile, startPage, title, endPage) {
+    await extractOutlineChapterGeneric(outlineCache, sourceFile, startPage, title, endPage);
+}
+
+async function extractOutlineChapterGeneric(cache, sourceFile, startPage, title, endPage) {
+    const outline = cache[sourceFile];
     if (!outline || !Array.isArray(outline) || outline.length === 0) {
         showToast('Kein Inhaltsverzeichnis verfügbar', 'error');
         return;
@@ -2337,6 +2544,9 @@ document.getElementById('btn-extract-confirm').addEventListener('click', extract
 
 document.getElementById('btn-compress').addEventListener('click', openCompressModal);
 document.getElementById('btn-compress-confirm').addEventListener('click', compressPDF);
+
+document.getElementById('btn-grid-outline').addEventListener('click', () => toggleGridOutlineFlyout());
+document.getElementById('btn-close-grid-outline').addEventListener('click', () => toggleGridOutlineFlyout(false));
 
 document.getElementById('btn-save').addEventListener('click', savePDF);
 document.getElementById('btn-new').addEventListener('click', newFile);

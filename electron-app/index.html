@@ -45,6 +45,17 @@
                         </svg>
                         <span>Komprimieren</span>
                     </button>
+                        <button class="tool-btn" id="btn-grid-outline" title="Inhalt anzeigen">
+                            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                <line x1="8" y1="6" x2="21" y2="6"/>
+                                <line x1="8" y1="12" x2="21" y2="12"/>
+                                <line x1="8" y1="18" x2="21" y2="18"/>
+                                <circle cx="4" cy="6" r="1.5"/>
+                                <circle cx="4" cy="12" r="1.5"/>
+                                <circle cx="4" cy="18" r="1.5"/>
+                            </svg>
+                            <span>Inhalt</span>
+                        </button>
                 </div>
             </div>
             <div class="header-right">
@@ -145,6 +156,18 @@
                         </button>
                     </div>
                 </div>
+                    <div class="grid-outline-flyout" id="grid-outline-flyout" hidden>
+                        <div class="grid-outline-header">
+                            <div class="grid-outline-title">Inhalt</div>
+                            <button class="icon-btn" id="btn-close-grid-outline" aria-label="Inhalt schließen">
+                                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                                    <line x1="18" y1="6" x2="6" y2="18"/>
+                                    <line x1="6" y1="6" x2="18" y2="18"/>
+                                </svg>
+                            </button>
+                        </div>
+                        <div class="grid-outline-body" id="grid-outline-body"></div>
+                    </div>
             </div>
         </main>
 
