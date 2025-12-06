@@ -1,0 +1,63 @@
+{
+  "name": "pedefo",
+  "version": "0.9.0",
+  "description": "Lightweight lokale PDF-App - Zusammenführen, Aufteilen, Komprimieren",
+  "main": "electron-app/main.js",
+  "scripts": {
+    "start": "electron .",
+    "dev": "NODE_ENV=development electron .",
+    "build": "electron-builder",
+    "build:win": "electron-builder --win",
+    "build:mac": "electron-builder --mac",
+    "build:linux": "electron-builder --linux"
+  },
+  "keywords": [
+    "pdf",
+    "merge",
+    "split",
+    "compress",
+    "electron"
+  ],
+  "author": "Pedefo",
+  "license": "MIT",
+  "devDependencies": {
+    "electron": "^28.0.0",
+    "electron-builder": "^24.9.1"
+  },
+  "build": {
+    "appId": "com.pedefo.app",
+    "productName": "Pedefo",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "electron-app/**/*",
+      "python-scripts/**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "python-scripts",
+        "to": "python-scripts"
+      },
+      {
+        "from": "electron-app/poppler",
+        "to": "poppler"
+      }
+    ],
+    "win": {
+      "target": "nsis",
+      "icon": "assets/icon_pedefo.ico"
+    },
+    "mac": {
+      "target": "dmg",
+      "icon": "electron-app/assets/icon.icns"
+    },
+    "linux": {
+      "target": "AppImage",
+      "icon": "electron-app/assets/icon.png"
+    }
+  },
+  "dependencies": {
+    "pdfjs-dist": "^5.4.449"
+  }
+}
