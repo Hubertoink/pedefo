@@ -17,7 +17,7 @@ const state = {
 // Utility Functions
 // ============================================
 
-function showToast(message, type = 'info', action = null) {
+function showToast(message, type = 'info') {
     const container = document.getElementById('toast-container');
     const toast = document.createElement('div');
     toast.className = `toast toast-${type}`;
@@ -32,17 +32,6 @@ function showToast(message, type = 'info', action = null) {
         <span class="toast-icon">${icons[type]}</span>
         <span class="toast-message">${message}</span>
     `;
-
-    if (action && action.label && typeof action.onClick === 'function') {
-        const btn = document.createElement('button');
-        btn.className = 'toast-action';
-        btn.textContent = action.label;
-        btn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            action.onClick();
-        });
-        toast.appendChild(btn);
-    }
     
     container.appendChild(toast);
     
@@ -220,13 +209,7 @@ function attachGridScrollHandler() {
     if (gridScrollHandlerAttached) return;
     const container = document.getElementById('pages-container');
     if (!container) return;
-    container.addEventListener('scroll', () => {
-        scheduleGridThumbnailLoad();
-        if (gridOutlineOpen) {
-            const activeIndex = getActiveGridPageIndex();
-            if (activeIndex !== -1) highlightGridOutlineForPage(activeIndex);
-        }
-    });
+    container.addEventListener('scroll', () => scheduleGridThumbnailLoad());
     gridScrollHandlerAttached = true;
 }
 
@@ -395,10 +378,6 @@ function renderPages() {
     
     updateSelectionBar();
     updateSplitIndicators();
-
-    if (gridOutlineOpen) {
-        renderGridOutlineFlyout();
-    }
 }
 
 function createPageCard(page, index) {
@@ -1205,7 +1184,6 @@ function newFile() {
     if (document.getElementById('page-viewer').style.display === 'flex') {
         closePageViewer();
     }
-    toggleGridOutlineFlyout(false);
     
     state.currentFile = null;
     state.pages = [];
@@ -1232,13 +1210,9 @@ let readerThumbLoading = new Set(); // currently loading reader thumbs
 let readerThumbLoadScheduled = false;
 let readerThumbScrollAttached = false;
 let outlineCache = {};             // Cache: { sourceFile: outline[] }
-let gridOutlineOpen = false;
 
 async function openReaderView(startPageIndex = 0) {
     readerCurrentPage = startPageIndex;
-
-    // Grid-Flyout schließen, damit der Reader sauber sichtbar ist
-    toggleGridOutlineFlyout(false);
     
     // Thumbnails für die Sidebar rendern
     renderReaderThumbnails();
@@ -1427,59 +1401,6 @@ function findPageIndexForOutline(sourceFile, pageNumber) {
     return state.pages.findIndex(p => p.sourceFile === sourceFile && p.originalNumber === pageNum);
 }
 
-function getMaxPageForSource(sourceFile) {
-    const pages = state.pages.filter(p => p.sourceFile === sourceFile).map(p => p.originalNumber);
-    if (pages.length === 0) return 0;
-    return Math.max(...pages);
-}
-
-function parseOutlinePageNumber(page) {
-    const num = parseInt(page, 10);
-    return Number.isNaN(num) ? null : num;
-}
-
-// Berechnet für jedes Outline-Element den Start- und Endbereich (bis zum nächsten Eintrag auf gleicher Ebene)
-function computeOutlineRanges(entries, maxPage) {
-    const ranges = new Map();
-    const flat = [];
-
-    const walk = (nodes, depth) => {
-        nodes.forEach((entry) => {
-            flat.push({ entry, page: parseOutlinePageNumber(entry.page), depth });
-            if (entry.children && entry.children.length > 0) {
-                walk(entry.children, depth + 1);
-            }
-        });
-    };
-
-    walk(entries, 0);
-
-    const itemsWithPage = flat.filter(n => n.page !== null);
-
-    for (let i = 0; i < itemsWithPage.length; i++) {
-        const current = itemsWithPage[i];
-        let end = maxPage || current.page;
-
-        for (let j = i + 1; j < itemsWithPage.length; j++) {
-            const next = itemsWithPage[j];
-            if (next.page === null) continue;
-            if (next.depth <= current.depth && next.page > current.page) {
-                end = next.page - 1;
-                break;
-            }
-        }
-
-        if (current.page !== null) {
-            ranges.set(current.entry, {
-                start: current.page,
-                end: Math.max(current.page, end)
-            });
-        }
-    }
-
-    return ranges;
-}
-
 async function loadOutlineForSources(forceRefresh = false) {
     const files = Array.from(new Set(state.pages.map(p => p.sourceFile)));
 
@@ -1527,9 +1448,7 @@ function renderOutlinePanel() {
             body.appendChild(sourceLabel);
         }
 
-        const maxPage = getMaxPageForSource(filePath);
-        const rangeMap = computeOutlineRanges(outline, maxPage);
-        appendOutlineItems(outline, filePath, body, 0, rangeMap);
+        appendOutlineItems(outline, filePath, body, 0);
     });
 
     if (!hasEntries) {
@@ -1539,56 +1458,11 @@ function renderOutlinePanel() {
     }
 }
 
-function renderGridOutlineFlyout() {
-    const body = document.getElementById('grid-outline-body');
-    if (!body) return;
-
-    body.innerHTML = '';
-    const placeholder = document.createElement('div');
-    placeholder.className = 'reader-outline-empty';
-    placeholder.textContent = 'Kein Inhaltsverzeichnis gefunden';
-
-    const files = Array.from(new Set(state.pages.map(p => p.sourceFile)));
-    const multipleSources = files.length > 1;
-    let hasEntries = false;
-
-    files.forEach((filePath) => {
-        const outline = outlineCache[filePath];
-        if (!outline || outline.length === 0) return;
-        hasEntries = true;
-
-        if (multipleSources) {
-            const sourceLabel = document.createElement('div');
-            sourceLabel.className = 'reader-outline-source';
-            sourceLabel.textContent = getBaseName(filePath);
-            body.appendChild(sourceLabel);
-        }
-
-        const maxPage = getMaxPageForSource(filePath);
-        const rangeMap = computeOutlineRanges(outline, maxPage);
-        appendGridOutlineItems(outline, filePath, body, 0, rangeMap);
-    });
-
-    if (!hasEntries) {
-        body.appendChild(placeholder);
-    } else {
-        const activeIndex = getActiveGridPageIndex();
-        if (activeIndex !== -1) {
-            highlightGridOutlineForPage(activeIndex);
-        }
-    }
-}
-
-function appendGridOutlineItems(entries, sourceFile, container, depth, rangeMap) {
+function appendOutlineItems(entries, sourceFile, container, depth) {
     entries.forEach((entry) => {
         const item = document.createElement('div');
         item.className = 'outline-item';
         item.style.paddingLeft = `${12 + depth * 14}px`;
-        item.dataset.sourceFile = sourceFile;
-
-        const range = rangeMap.get(entry) || null;
-        const startPage = range ? range.start : parseOutlinePageNumber(entry.page);
-        const endPage = range ? range.end : startPage;
 
         const titleSpan = document.createElement('span');
         titleSpan.className = 'outline-title';
@@ -1596,162 +1470,9 @@ function appendGridOutlineItems(entries, sourceFile, container, depth, rangeMap)
 
         const pageSpan = document.createElement('span');
         pageSpan.className = 'outline-page';
-        if (startPage !== null) {
-            const rangeText = endPage !== null && endPage !== startPage
-                ? `S. ${startPage}-${endPage}`
-                : `S. ${startPage}`;
-            pageSpan.textContent = rangeText;
-            item.dataset.rangeStart = startPage;
-            item.dataset.rangeEnd = endPage;
-        } else {
-            pageSpan.textContent = '';
-        }
+        pageSpan.textContent = entry.page ? `S. ${entry.page}` : '';
 
-        const actions = document.createElement('div');
-        actions.className = 'grid-outline-actions';
-        const exportBtn = document.createElement('button');
-        exportBtn.className = 'grid-outline-action';
-        exportBtn.title = 'Kapitel exportieren';
-        exportBtn.innerHTML = `
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 5v10" />
-                <path d="M7 10l5 5 5-5" />
-                <rect x="5" y="17" width="14" height="2" rx="1" />
-            </svg>
-        `;
-        exportBtn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            extractGridOutlineChapter(sourceFile, startPage, entry.title, endPage);
-        });
-        actions.appendChild(exportBtn);
-
-        const targetIndex = findPageIndexForOutline(sourceFile, startPage);
-        if (targetIndex === -1) {
-            item.classList.add('disabled');
-        } else {
-            item.dataset.targetIndex = targetIndex;
-            item.addEventListener('click', () => {
-                scrollGridToPage(targetIndex);
-                highlightGridOutlineForPage(targetIndex);
-            });
-        }
-
-        item.appendChild(titleSpan);
-        item.appendChild(pageSpan);
-        item.appendChild(actions);
-        container.appendChild(item);
-
-        if (entry.children && entry.children.length > 0) {
-            appendGridOutlineItems(entry.children, sourceFile, container, depth + 1, rangeMap);
-        }
-    });
-}
-
-function getActiveGridPageIndex() {
-    if (state.selectedPages.size > 0) {
-        const firstSelected = Array.from(state.selectedPages)[0];
-        const selIdx = state.pages.findIndex(p => p.id === firstSelected);
-        if (selIdx !== -1) return selIdx;
-    }
-    const visible = getVisiblePagesInGrid();
-    if (visible.length > 0) return visible[0].index;
-    return state.pages.length > 0 ? 0 : -1;
-}
-
-function highlightGridOutlineForPage(pageIndex) {
-    const page = state.pages[pageIndex];
-    if (!page) return;
-
-    let activeItem = null;
-    document.querySelectorAll('#grid-outline-flyout .outline-item').forEach((item) => {
-        const sourceMatches = item.dataset.sourceFile === page.sourceFile;
-        const start = parseInt(item.dataset.rangeStart, 10);
-        const end = parseInt(item.dataset.rangeEnd, 10);
-        const inRange = sourceMatches && !Number.isNaN(start) && !Number.isNaN(end) &&
-            page.originalNumber >= start && page.originalNumber <= end;
-
-        item.classList.toggle('active', inRange);
-        if (inRange) activeItem = item;
-    });
-
-    if (!activeItem) {
-        document.querySelectorAll('#grid-outline-flyout .outline-item').forEach((item) => {
-            const idx = parseInt(item.dataset.targetIndex, 10);
-            const isActive = Number.isInteger(idx) && idx === pageIndex;
-            item.classList.toggle('active', isActive);
-            if (isActive) activeItem = item;
-        });
-    }
-
-    if (activeItem) {
-        activeItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    }
-}
-
-function scrollGridToPage(pageIndex) {
-    const page = state.pages[pageIndex];
-    if (!page) return;
-    const card = document.querySelector(`.page-card[data-page-id="${page.id}"]`);
-    const container = document.getElementById('pages-container');
-    if (!card || !container) return;
-
-    state.selectedPages.clear();
-    state.selectedPages.add(page.id);
-    updatePageSelectionUI();
-    updateSelectionBar();
-
-    const targetTop = card.offsetTop - container.clientHeight / 2 + card.clientHeight / 2;
-    container.scrollTo({ top: Math.max(0, targetTop), behavior: 'smooth' });
-}
-
-async function toggleGridOutlineFlyout(showExplicit) {
-    const flyout = document.getElementById('grid-outline-flyout');
-    if (!flyout) return;
-    const shouldShow = typeof showExplicit === 'boolean' ? showExplicit : flyout.hidden;
-
-    if (!shouldShow) {
-        flyout.hidden = true;
-        gridOutlineOpen = false;
-        return;
-    }
-
-    if (!state.pages.length) return;
-
-    await loadOutlineForSources();
-    renderGridOutlineFlyout();
-    flyout.hidden = false;
-    gridOutlineOpen = true;
-}
-
-function appendOutlineItems(entries, sourceFile, container, depth, rangeMap) {
-    entries.forEach((entry) => {
-        const item = document.createElement('div');
-        item.className = 'outline-item';
-        item.style.paddingLeft = `${12 + depth * 14}px`;
-        item.dataset.sourceFile = sourceFile;
-
-        const range = rangeMap.get(entry) || null;
-        const startPage = range ? range.start : parseOutlinePageNumber(entry.page);
-        const endPage = range ? range.end : startPage;
-
-        const titleSpan = document.createElement('span');
-        titleSpan.className = 'outline-title';
-        titleSpan.textContent = entry.title || 'Ohne Titel';
-
-        const pageSpan = document.createElement('span');
-        pageSpan.className = 'outline-page';
-        if (startPage !== null) {
-            const rangeText = endPage !== null && endPage !== startPage
-                ? `S. ${startPage}-${endPage}`
-                : `S. ${startPage}`;
-            pageSpan.textContent = rangeText;
-            item.dataset.rangeStart = startPage;
-            item.dataset.rangeEnd = endPage;
-        } else {
-            pageSpan.textContent = '';
-        }
-
-        const targetIndex = findPageIndexForOutline(sourceFile, startPage);
+        const targetIndex = findPageIndexForOutline(sourceFile, entry.page);
         if (targetIndex === -1) {
             item.classList.add('disabled');
         } else {
@@ -1764,36 +1485,20 @@ function appendOutlineItems(entries, sourceFile, container, depth, rangeMap) {
         container.appendChild(item);
 
         if (entry.children && entry.children.length > 0) {
-            appendOutlineItems(entry.children, sourceFile, container, depth + 1, rangeMap);
+            appendOutlineItems(entry.children, sourceFile, container, depth + 1);
         }
     });
 }
 
 function highlightOutlineForPage(pageIndex) {
-    const page = state.pages[pageIndex];
-    if (!page) return;
-
+    const items = document.querySelectorAll('.outline-item');
     let activeItem = null;
-    document.querySelectorAll('.outline-item').forEach((item) => {
-        const sourceMatches = item.dataset.sourceFile === page.sourceFile;
-        const start = parseInt(item.dataset.rangeStart, 10);
-        const end = parseInt(item.dataset.rangeEnd, 10);
-        const inRange = sourceMatches && !Number.isNaN(start) && !Number.isNaN(end) &&
-            page.originalNumber >= start && page.originalNumber <= end;
-
-        item.classList.toggle('active', inRange);
-        if (inRange) activeItem = item;
+    items.forEach((item) => {
+        const idx = parseInt(item.dataset.targetIndex, 10);
+        const isActive = Number.isInteger(idx) && idx === pageIndex;
+        item.classList.toggle('active', isActive);
+        if (isActive) activeItem = item;
     });
-
-    if (!activeItem) {
-        // Fallback: exakter Seitenstart falls kein Bereich gesetzt wurde
-        document.querySelectorAll('.outline-item').forEach((item) => {
-            const idx = parseInt(item.dataset.targetIndex, 10);
-            const isActive = Number.isInteger(idx) && idx === pageIndex;
-            item.classList.toggle('active', isActive);
-            if (isActive) activeItem = item;
-        });
-    }
 
     if (activeItem) {
         activeItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
@@ -2202,40 +1907,23 @@ function renderViewerOutline() {
             body.appendChild(sourceLabel);
         }
         
-        const maxPage = getMaxPageForSource(filePath);
-        const rangeMap = computeOutlineRanges(outline, maxPage);
-        appendViewerOutlineItems(outline, filePath, body, 0, rangeMap);
+        appendViewerOutlineItems(outline, filePath, body, 0);
     });
     
     if (!hasEntries) {
         body.appendChild(placeholder);
-    } else {
-        highlightViewerOutline(viewerCurrentPage);
     }
 }
 
-function appendViewerOutlineItems(items, sourceFile, container, depth, rangeMap) {
+function appendViewerOutlineItems(items, sourceFile, container, depth) {
     items.forEach((item) => {
         const el = document.createElement('div');
         el.className = 'viewer-outline-item';
         el.dataset.depth = depth;
-        el.dataset.sourceFile = sourceFile;
 
         const label = document.createElement('span');
         label.className = 'viewer-outline-text';
         label.textContent = item.title || 'Ohne Titel';
-
-        const range = rangeMap.get(item) || null;
-        const startPage = range ? range.start : parseOutlinePageNumber(item.page);
-        const endPage = range ? range.end : startPage;
-        const rangeLabel = startPage !== null
-            ? (endPage !== null && endPage !== startPage ? `S. ${startPage}-${endPage}` : `S. ${startPage}`)
-            : '';
-
-        if (startPage !== null) {
-            el.dataset.rangeStart = startPage;
-            el.dataset.rangeEnd = endPage;
-        }
 
         const actions = document.createElement('div');
         actions.className = 'viewer-outline-actions';
@@ -2243,29 +1931,17 @@ function appendViewerOutlineItems(items, sourceFile, container, depth, rangeMap)
         const extractBtn = document.createElement('button');
         extractBtn.className = 'viewer-outline-action';
         extractBtn.title = 'Kapitel extrahieren';
-        extractBtn.innerHTML = `
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                <path d="M12 5v10" />
-                <path d="M7 10l5 5 5-5" />
-                <rect x="5" y="17" width="14" height="2" rx="1" />
-            </svg>
-        `;
+        extractBtn.textContent = 'Ex';
         extractBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            extractOutlineChapter(sourceFile, startPage, item.title, endPage);
+            extractOutlineChapter(sourceFile, item.page, item.title);
         });
         actions.appendChild(extractBtn);
 
         el.appendChild(label);
-        if (rangeLabel) {
-            const rangeSpan = document.createElement('span');
-            rangeSpan.className = 'viewer-outline-range';
-            rangeSpan.textContent = rangeLabel;
-            el.appendChild(rangeSpan);
-        }
         el.appendChild(actions);
 
-        const pageIndex = findViewerPageIndex(sourceFile, startPage);
+        const pageIndex = findViewerPageIndex(sourceFile, item.page);
         if (pageIndex !== -1) {
             el.addEventListener('click', () => {
                 showViewerPage(pageIndex);
@@ -2277,21 +1953,13 @@ function appendViewerOutlineItems(items, sourceFile, container, depth, rangeMap)
         container.appendChild(el);
 
         if (item.children && item.children.length > 0) {
-            appendViewerOutlineItems(item.children, sourceFile, container, depth + 1, rangeMap);
+            appendViewerOutlineItems(item.children, sourceFile, container, depth + 1);
         }
     });
 }
 
-async function extractOutlineChapter(sourceFile, startPage, title, endPage) {
-    await extractOutlineChapterGeneric(viewerOutlineCache, sourceFile, startPage, title, endPage);
-}
-
-async function extractGridOutlineChapter(sourceFile, startPage, title, endPage) {
-    await extractOutlineChapterGeneric(outlineCache, sourceFile, startPage, title, endPage);
-}
-
-async function extractOutlineChapterGeneric(cache, sourceFile, startPage, title, endPage) {
-    const outline = cache[sourceFile];
+async function extractOutlineChapter(sourceFile, startPage, title) {
+    const outline = viewerOutlineCache[sourceFile];
     if (!outline || !Array.isArray(outline) || outline.length === 0) {
         showToast('Kein Inhaltsverzeichnis verfügbar', 'error');
         return;
@@ -2313,24 +1981,15 @@ async function extractOutlineChapterGeneric(cache, sourceFile, startPage, title,
         return;
     }
 
-    let end = null;
-
-    if (endPage !== null && endPage !== undefined && !Number.isNaN(parseInt(endPage, 10))) {
-        end = parseInt(endPage, 10);
-    } else {
-        const idx = sorted.findIndex(e => e.page === start);
-        if (idx === -1) {
-            showToast('Kapitel konnte nicht gefunden werden', 'error');
-            return;
-        }
-        // Find next outline entry on a later page (ignore entries on the same page)
-        const nextLater = sorted.slice(idx + 1).find(e => e.page > start);
-        end = nextLater ? nextLater.page - 1 : maxPage;
+    const idx = sorted.findIndex(e => e.page === start);
+    if (idx === -1) {
+        showToast('Kapitel konnte nicht gefunden werden', 'error');
+        return;
     }
 
-    if (end === null || Number.isNaN(end) || end < start) {
-        end = start;
-    }
+    // Find next outline entry on a later page (ignore entries on the same page)
+    const nextLater = sorted.slice(idx + 1).find(e => e.page > start);
+    const end = nextLater ? nextLater.page - 1 : maxPage;
     const pagesToExtract = pagesForSource
         .filter(p => p.originalNumber >= start && p.originalNumber <= end)
         .map(p => ({ originalNumber: p.originalNumber, rotation: p.rotation }));
@@ -2349,12 +2008,7 @@ async function extractOutlineChapterGeneric(cache, sourceFile, startPage, title,
         const operations = [{ sourceFile, pages: pagesToExtract }];
         const result = await window.pedefo.pdf.buildPDF(operations, outputPath);
         if (result.success) {
-            showToast('Kapitel extrahiert', 'success', {
-                label: 'Öffnen',
-                onClick: () => {
-                    window.pedefo.file.openPath(outputPath);
-                }
-            });
+            showToast('Kapitel extrahiert', 'success');
         } else {
             throw new Error(result.message || 'Fehler beim Extrahieren');
         }
@@ -2386,22 +2040,15 @@ function findViewerPageIndex(sourceFile, pageNumber) {
 function highlightViewerOutline(pageIndex) {
     const page = state.pages[pageIndex];
     if (!page) return;
-
-    let activeItem = null;
-    document.querySelectorAll('.viewer-outline-item').forEach((item) => {
-        const sourceMatches = item.dataset.sourceFile === page.sourceFile;
-        const start = parseInt(item.dataset.rangeStart, 10);
-        const end = parseInt(item.dataset.rangeEnd, 10);
-        const inRange = sourceMatches && !Number.isNaN(start) && !Number.isNaN(end) &&
-            page.originalNumber >= start && page.originalNumber <= end;
-
-        item.classList.toggle('active', inRange);
-        if (inRange) activeItem = item;
-    });
-
-    if (activeItem) {
-        activeItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
-    }
+    
+    document.querySelectorAll('.viewer-outline-item').forEach(item => item.classList.remove('active'));
+    
+    // Find matching outline item (simplified - exact match only)
+    const outline = viewerOutlineCache[page.sourceFile];
+    if (!outline) return;
+    
+    // This would need more sophisticated matching logic for nested items
+    // For now, just highlight based on page number proximity
 }
 
 // Event Listeners
@@ -2544,9 +2191,6 @@ document.getElementById('btn-extract-confirm').addEventListener('click', extract
 
 document.getElementById('btn-compress').addEventListener('click', openCompressModal);
 document.getElementById('btn-compress-confirm').addEventListener('click', compressPDF);
-
-document.getElementById('btn-grid-outline').addEventListener('click', () => toggleGridOutlineFlyout());
-document.getElementById('btn-close-grid-outline').addEventListener('click', () => toggleGridOutlineFlyout(false));
 
 document.getElementById('btn-save').addEventListener('click', savePDF);
 document.getElementById('btn-new').addEventListener('click', newFile);

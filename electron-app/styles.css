@@ -660,88 +660,6 @@ body {
     z-index: 100;
 }
 
-/* ============================================
-   Grid Outline Flyout
-   ============================================ */
-
-.grid-outline-flyout {
-    position: fixed;
-    top: calc(var(--header-height) + 16px);
-    right: 24px;
-    width: 320px;
-    max-height: calc(100vh - var(--header-height) - 32px);
-    background: var(--bg-primary);
-    border: 1px solid var(--border-color);
-    border-radius: var(--radius-lg);
-    box-shadow: 0 12px 32px rgba(0,0,0,0.14);
-    display: flex;
-    flex-direction: column;
-    overflow: hidden;
-    z-index: 120;
-}
-
-.grid-outline-header {
-    display: flex;
-    align-items: center;
-    justify-content: space-between;
-    padding: 12px 14px;
-    border-bottom: 1px solid var(--border-color);
-    font-size: 13px;
-    font-weight: 600;
-    color: var(--text-secondary);
-}
-
-.grid-outline-title {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-}
-
-.grid-outline-body {
-    flex: 1;
-    overflow-y: auto;
-    overflow-x: hidden;
-    padding: 8px 0;
-}
-
-.grid-outline-flyout .outline-item {
-    padding-right: 14px;
-}
-
-.grid-outline-actions {
-    display: flex;
-    align-items: center;
-    gap: 4px;
-}
-
-.grid-outline-action {
-    border: none;
-    background: var(--accent-light);
-    color: var(--accent);
-    padding: 4px 8px;
-    border-radius: 6px;
-    cursor: pointer;
-    transition: all 0.12s ease;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 4px;
-}
-
-.grid-outline-action:hover {
-    background: var(--accent);
-    color: white;
-}
-
-.grid-outline-action svg {
-    width: 14px;
-    height: 14px;
-}
-
-.grid-outline-flyout[hidden] {
-    display: none;
-}
-
 .selection-toggle {
     width: 32px;
     height: 32px;
@@ -1025,7 +943,7 @@ body {
     position: fixed;
     bottom: 24px;
     left: 24px;
-    z-index: 25000; /* Above reader/page-viewer overlays */
+    z-index: 2000;
     display: flex;
     flex-direction: column;
     gap: 8px;
@@ -1071,22 +989,6 @@ body {
 .toast-message {
     font-size: 13px;
     color: var(--text-primary);
-}
-
-.toast-action {
-    margin-left: auto;
-    padding: 6px 10px;
-    background: var(--accent);
-    color: white;
-    border: none;
-    border-radius: var(--radius-sm);
-    font-size: 12px;
-    cursor: pointer;
-    transition: background 0.15s ease;
-}
-
-.toast-action:hover {
-    background: var(--accent-hover);
 }
 
 /* ============================================
@@ -1466,7 +1368,6 @@ body {
     display: flex;
     flex-direction: column;
     flex-shrink: 0;
-    overflow: hidden;
 }
 
 .reader-outline-header {
@@ -1503,7 +1404,6 @@ body {
 .reader-outline-body {
     flex: 1;
     overflow-y: auto;
-    overflow-x: hidden;
     padding: 8px 0;
 }
 
@@ -1528,8 +1428,6 @@ body {
     padding: 8px 12px;
     cursor: pointer;
     transition: background 0.15s ease, color 0.15s ease;
-    box-sizing: border-box;
-    width: 100%;
 }
 
 .outline-item:hover {
@@ -1974,12 +1872,6 @@ body {
     min-width: 0;
 }
 
-.viewer-outline-range {
-    color: rgba(255, 255, 255, 0.7);
-    font-size: 12px;
-    white-space: nowrap;
-}
-
 .viewer-outline-actions {
     display: flex;
     gap: 6px;
@@ -1994,19 +1886,10 @@ body {
     font-size: 11px;
     cursor: pointer;
     transition: all 0.15s;
-    display: inline-flex;
-    align-items: center;
-    justify-content: center;
-    gap: 4px;
 }
 
 .viewer-outline-action:hover {
     background: rgba(255, 255, 255, 0.22);
-}
-
-.viewer-outline-action svg {
-    width: 14px;
-    height: 14px;
 }
 
 .viewer-outline-item.disabled {

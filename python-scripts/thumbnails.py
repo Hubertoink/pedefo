@@ -40,6 +40,11 @@ def response(success, message, data=None):
 
 def get_poppler_path():
     """Ermittle den Pfad zu Poppler"""
+    # Zuerst Umgebungsvariable prüfen (von Electron gesetzt)
+    env_path = os.environ.get('POPPLER_PATH')
+    if env_path and os.path.exists(env_path):
+        return env_path
+    
     script_dir = Path(__file__).parent
     
     # Im Development: relativ zum Script im electron-app Ordner

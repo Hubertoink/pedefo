@@ -8,6 +8,9 @@
     "dev": "NODE_ENV=development electron .",
     "build": "electron-builder",
     "build:win": "electron-builder --win",
+    "build:win:x64": "electron-builder --win --x64",
+    "build:win:arm64": "electron-builder --win --arm64",
+    "build:win:all": "electron-builder --win --x64 --arm64",
     "build:mac": "electron-builder --mac",
     "build:linux": "electron-builder --linux"
   },
@@ -31,13 +34,13 @@
       "output": "dist"
     },
     "files": [
-      "electron-app/**/*",
-      "python-scripts/**/*"
+      "electron-app/**/*"
     ],
     "extraResources": [
       {
-        "from": "python-scripts",
-        "to": "python-scripts"
+        "from": "python-dist",
+        "to": "python-dist",
+        "filter": ["**/*.exe"]
       },
       {
         "from": "electron-app/poppler",
@@ -45,7 +48,12 @@
       }
     ],
     "win": {
-      "target": "nsis",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": ["x64"]
+        }
+      ],
       "icon": "assets/icon_pedefo.ico"
     },
     "mac": {

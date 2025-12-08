@@ -14,6 +14,16 @@ const pythonScriptsPath = isDev
     ? path.join(__dirname, '..', 'python-scripts')
     : path.join(process.resourcesPath, 'python-scripts');
 
+// Python executables Pfad (für gebundelte Version)
+const pythonDistPath = isDev
+    ? null  // In dev mode use regular python
+    : path.join(process.resourcesPath, 'python-dist');
+
+// Poppler-Pfad ermitteln
+const popplerPath = isDev
+    ? path.join(__dirname, 'poppler', 'poppler-25.12.0', 'Library', 'bin')
+    : path.join(process.resourcesPath, 'poppler', 'poppler-25.12.0', 'Library', 'bin');
+
 function createWindow() {
     mainWindow = new BrowserWindow({
         width: 1200,
@@ -110,16 +120,39 @@ ipcMain.on('close-without-save', () => {
 
 function runPython(script, args) {
     return new Promise((resolve, reject) => {
-        const scriptPath = path.join(pythonScriptsPath, script);
+        let command, commandArgs;
         
-        // Prüfe ob das Skript existiert
-        if (!fs.existsSync(scriptPath)) {
-            reject(new Error(`Python-Skript nicht gefunden: ${scriptPath}`));
-            return;
+        if (isDev) {
+            // Development: use python interpreter
+            const scriptPath = path.join(pythonScriptsPath, script);
+            
+            if (!fs.existsSync(scriptPath)) {
+                reject(new Error(`Python-Skript nicht gefunden: ${scriptPath}`));
+                return;
+            }
+            
+            command = 'python';
+            commandArgs = [scriptPath, ...args];
+        } else {
+            // Production: use bundled executable
+            const exeName = script.replace('.py', '.exe');
+            const exePath = path.join(pythonDistPath, exeName);
+            
+            if (!fs.existsSync(exePath)) {
+                reject(new Error(`Python-Executable nicht gefunden: ${exePath}`));
+                return;
+            }
+            
+            command = exePath;
+            commandArgs = args;
         }
 
-        const pythonProcess = spawn('python', [scriptPath, ...args], {
-            cwd: pythonScriptsPath
+        const pythonProcess = spawn(command, commandArgs, {
+            cwd: isDev ? pythonScriptsPath : pythonDistPath,
+            env: {
+                ...process.env,
+                POPPLER_PATH: popplerPath
+            }
         });
 
         let stdout = '';
