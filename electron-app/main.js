@@ -118,8 +118,9 @@ ipcMain.on('close-without-save', () => {
 // Python Bridge - Kommunikation mit Python
 // ============================================
 
-function runPython(script, args) {
+function runPython(script, args, options = {}) {
     return new Promise((resolve, reject) => {
+        const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
         let command, commandArgs;
 
         const getDevPythonCommand = () => {
@@ -181,9 +182,33 @@ function runPython(script, args) {
 
         let stdout = '';
         let stderr = '';
+        let stdoutLineBuffer = '';
+
+        const handleProgressLine = (line) => {
+            if (!onProgress) return;
+            const trimmed = line.trim();
+            if (!trimmed.startsWith('{') || !trimmed.endsWith('}')) return;
+
+            try {
+                const payload = JSON.parse(trimmed);
+                if (payload && payload.type === 'progress') {
+                    onProgress(payload);
+                }
+            } catch (_) {
+                // Ignore non-progress output.
+            }
+        };
 
         pythonProcess.stdout.on('data', (data) => {
-            stdout += data.toString();
+            const text = data.toString();
+            stdout += text;
+
+            if (onProgress) {
+                stdoutLineBuffer += text;
+                const lines = stdoutLineBuffer.split(/\r?\n/);
+                stdoutLineBuffer = lines.pop() || '';
+                lines.forEach(handleProgressLine);
+            }
         });
 
         pythonProcess.stderr.on('data', (data) => {
@@ -191,6 +216,11 @@ function runPython(script, args) {
         });
 
         pythonProcess.on('close', (code) => {
+            if (stdoutLineBuffer) {
+                handleProgressLine(stdoutLineBuffer);
+                stdoutLineBuffer = '';
+            }
+
             if (code === 0) {
                 try {
                     // Versuche JSON zu parsen
@@ -344,10 +374,21 @@ ipcMain.handle('pdf:rotate', async (event, inputFile, pages, rotation, outputPat
     }
 });
 
-ipcMain.handle('pdf:compress', async (event, inputFile, outputPath, quality) => {
+ipcMain.handle('pdf:compress', async (event, inputFile, outputPath, quality, operationId) => {
     try {
         const args = ['compress', inputFile, outputPath, quality || 'medium'];
-        const result = await runPython('compress.py', args);
+        const result = await runPython('compress.py', args, {
+            onProgress: (progress) => {
+                event.sender.send('pdf:compress-progress', {
+                    operationId,
+                    percent: progress.percent,
+                    message: progress.message,
+                    stage: progress.stage,
+                    current: progress.current,
+                    total: progress.total
+                });
+            }
+        });
         return result;
     } catch (error) {
         return { success: false, message: error.message };

@@ -224,14 +224,49 @@ function showToast(message, type = 'info') {
     }, 4000);
 }
 
-function showLoading(text = 'Verarbeite...') {
+function setLoadingProgress(percent = 0, detail = '') {
+    const progress = document.getElementById('loading-progress');
+    const fill = document.getElementById('loading-progress-fill');
+    const percentText = document.getElementById('loading-progress-percent');
+    const detailText = document.getElementById('loading-progress-detail');
+    if (!progress || !fill || !percentText || !detailText) return;
+
+    const safePercent = Math.max(0, Math.min(100, Number(percent) || 0));
+    progress.style.display = 'block';
+    progress.setAttribute('aria-valuenow', String(Math.round(safePercent)));
+    fill.style.width = `${safePercent}%`;
+    percentText.textContent = `${Math.round(safePercent)}%`;
+    detailText.textContent = detail || 'Wird verarbeitet...';
+}
+
+function hideLoadingProgress() {
+    const progress = document.getElementById('loading-progress');
+    const fill = document.getElementById('loading-progress-fill');
+    const percentText = document.getElementById('loading-progress-percent');
+    const detailText = document.getElementById('loading-progress-detail');
+    if (!progress || !fill || !percentText || !detailText) return;
+
+    progress.style.display = 'none';
+    progress.setAttribute('aria-valuenow', '0');
+    fill.style.width = '0%';
+    percentText.textContent = '0%';
+    detailText.textContent = 'Wird vorbereitet...';
+}
+
+function showLoading(text = 'Verarbeite...', options = {}) {
     const loading = document.getElementById('loading');
     document.getElementById('loading-text').textContent = text;
+    if (options.progress) {
+        setLoadingProgress(options.percent || 0, options.detail || 'Wird vorbereitet...');
+    } else {
+        hideLoadingProgress();
+    }
     loading.style.display = 'flex';
 }
 
 function hideLoading() {
     document.getElementById('loading').style.display = 'none';
+    hideLoadingProgress();
 }
 
 function getBaseName(filePath) {
@@ -1429,7 +1464,21 @@ async function compressPDF() {
     const outputPath = await window.pedefo.saveFile('komprimiert.pdf');
     if (!outputPath) return;
     
-    showLoading('Komprimiere PDF...');
+    const operationId = `compress-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    let stopProgressListener = null;
+
+    showLoading('Komprimiere PDF...', {
+        progress: true,
+        percent: 5,
+        detail: 'Wird vorbereitet...'
+    });
+
+    if (window.pedefo.pdf.onCompressProgress) {
+        stopProgressListener = window.pedefo.pdf.onCompressProgress((progress) => {
+            if (progress?.operationId && progress.operationId !== operationId) return;
+            setLoadingProgress(progress.percent, progress.message || 'Wird verarbeitet...');
+        });
+    }
     
     try {
         // First save current state, then compress
@@ -1463,11 +1512,13 @@ async function compressPDF() {
         
         let result;
         if (sourceFile && !state.isDirty) {
-            result = await window.pedefo.pdf.compress(sourceFile, outputPath, quality);
+            result = await window.pedefo.pdf.compress(sourceFile, outputPath, quality, operationId);
         } else {
             // Build temp file first, then compress
+            setLoadingProgress(8, 'Aktuelles PDF wird vorbereitet...');
             await window.pedefo.pdf.buildPDF(operations, tempPath);
-            result = await window.pedefo.pdf.compress(tempPath, outputPath, quality);
+            setLoadingProgress(12, 'Kompression startet...');
+            result = await window.pedefo.pdf.compress(tempPath, outputPath, quality, operationId);
         }
         
         if (result.success) {
@@ -1496,6 +1547,9 @@ async function compressPDF() {
     } catch (error) {
         showToast(error.message, 'error');
     } finally {
+        if (typeof stopProgressListener === 'function') {
+            stopProgressListener();
+        }
         hideLoading();
     }
 }

@@ -10,6 +10,7 @@ import subprocess
 import shutil
 import glob
 import re
+import threading
 
 
 def response(success, message, data=None):
@@ -33,11 +34,45 @@ def response(success, message, data=None):
         print(json.dumps(result, ensure_ascii=True))
 
 
+def progress(percent, message, stage=None, current=None, total=None):
+    """Sendet eine Fortschrittsmeldung als JSON-Zeile an Electron."""
+    payload = {
+        "type": "progress",
+        "percent": max(0, min(100, int(round(percent)))),
+        "message": message
+    }
+    if stage:
+        payload["stage"] = stage
+    if current is not None:
+        payload["current"] = current
+    if total is not None:
+        payload["total"] = total
+
+    try:
+        sys.stdout.reconfigure(encoding='utf-8')
+    except Exception:
+        pass
+
+    try:
+        print(json.dumps(payload, ensure_ascii=False), flush=True)
+    except Exception:
+        print(json.dumps(payload, ensure_ascii=True), flush=True)
+
+
 def get_file_size_mb(file_path):
     """Gibt die Dateigröße in MB zurück"""
     if os.path.exists(file_path):
         return os.path.getsize(file_path) / (1024 * 1024)
     return 0
+
+
+def get_page_count(input_file):
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(input_file)
+        return len(reader.pages)
+    except Exception:
+        return None
 
 
 def find_ghostscript():
@@ -84,12 +119,14 @@ def find_ghostscript():
     return None
 
 
-def compress_with_ghostscript(input_file, output_file, quality="ebook"):
+def compress_with_ghostscript(input_file, output_file, quality="ebook", total_pages=None):
     """Komprimiert PDF mit Ghostscript"""
     gs_path = find_ghostscript()
     
     if not gs_path:
         return False, "Ghostscript nicht gefunden. Bitte installiere Ghostscript."
+
+    progress(12, "Ghostscript wird gestartet...", "ghostscript", 0, total_pages)
     
     # Quality-Stufen: screen (72dpi), ebook (150dpi), printer (300dpi), prepress (300dpi+)
     quality_map = {
@@ -107,37 +144,79 @@ def compress_with_ghostscript(input_file, output_file, quality="ebook"):
         "-dCompatibilityLevel=1.4",
         f"-dPDFSETTINGS=/{gs_quality}",
         "-dNOPAUSE",
-        "-dQUIET",
         "-dBATCH",
         f"-sOutputFile={output_file}",
         input_file
     ]
     
     try:
-        result = subprocess.run(gs_cmd, capture_output=True, text=True, timeout=300)
+        process = subprocess.Popen(
+            gs_cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            errors="replace"
+        )
+
+        output_lines = []
+        last_page = 0
+        timed_out = {"expired": False}
+
+        def kill_on_timeout():
+            timed_out["expired"] = True
+            try:
+                process.kill()
+            except Exception:
+                pass
+
+        timer = threading.Timer(300, kill_on_timeout)
+        timer.start()
+
+        try:
+            for line in process.stdout or []:
+                output_lines.append(line)
+                match = re.search(r"\bPage\s+(\d+)\b", line)
+                if match:
+                    last_page = int(match.group(1))
+                    if total_pages:
+                        percent = 12 + (last_page / total_pages) * 76
+                        progress(percent, f"Seite {last_page} von {total_pages} wird komprimiert...", "ghostscript", last_page, total_pages)
+                    else:
+                        progress(35, f"Seite {last_page} wird komprimiert...", "ghostscript", last_page, None)
+
+            returncode = process.wait()
+        finally:
+            timer.cancel()
+
+        if timed_out["expired"]:
+            return False, "Timeout bei der Kompression"
         
-        if result.returncode == 0 and os.path.exists(output_file):
+        if returncode == 0 and os.path.exists(output_file):
+            progress(92, "Komprimierte Datei wird geprüft...", "finalize", total_pages, total_pages)
             return True, "Erfolgreich mit Ghostscript komprimiert"
         else:
-            return False, f"Ghostscript Fehler: {result.stderr}"
-    except subprocess.TimeoutExpired:
-        return False, "Timeout bei der Kompression"
+            return False, f"Ghostscript Fehler: {''.join(output_lines).strip()}"
     except Exception as e:
         return False, f"Fehler: {str(e)}"
 
 
-def compress_with_pypdf(input_file, output_file):
+def compress_with_pypdf(input_file, output_file, total_pages=None):
     """Fallback-Kompression mit PyPDF2 (weniger effektiv)"""
     try:
         from PyPDF2 import PdfReader, PdfWriter
         
         reader = PdfReader(input_file)
         writer = PdfWriter()
+        page_count = total_pages or len(reader.pages)
+        progress(12, "Basis-Kompression wird gestartet...", "pypdf", 0, page_count)
         
-        for page in reader.pages:
+        for index, page in enumerate(reader.pages, start=1):
             page.compress_content_streams()
             writer.add_page(page)
+            percent = 12 + (index / page_count) * 76 if page_count else 55
+            progress(percent, f"Seite {index} von {page_count} wird komprimiert...", "pypdf", index, page_count)
         
+        progress(92, "Komprimierte Datei wird geschrieben...", "finalize", page_count, page_count)
         with open(output_file, "wb") as f:
             writer.write(f)
         
@@ -154,21 +233,29 @@ def compress_pdf(input_file, output_file, quality="medium"):
         response(False, f"Datei nicht gefunden: {input_file}")
         return
     
+    progress(5, "PDF wird analysiert...", "prepare")
     original_size = get_file_size_mb(input_file)
+    total_pages = get_page_count(input_file)
+    if total_pages:
+        progress(10, f"{total_pages} Seiten gefunden", "prepare", 0, total_pages)
+    else:
+        progress(10, "Seiten werden vorbereitet...", "prepare")
     
     # Versuche zuerst Ghostscript
-    success, message = compress_with_ghostscript(input_file, output_file, quality)
+    success, message = compress_with_ghostscript(input_file, output_file, quality, total_pages)
     
     # Fallback zu PyPDF2 wenn Ghostscript fehlschlägt
     if not success:
         gs_error = message
-        success, message = compress_with_pypdf(input_file, output_file)
+        progress(12, "Fallback-Kompression wird gestartet...", "pypdf", 0, total_pages)
+        success, message = compress_with_pypdf(input_file, output_file, total_pages)
         if success:
             message += f" (Ghostscript nicht verfügbar: {gs_error})"
     
     if success and os.path.exists(output_file):
         new_size = get_file_size_mb(output_file)
         reduction = ((original_size - new_size) / original_size * 100) if original_size > 0 else 0
+        progress(100, "Kompression abgeschlossen", "done", total_pages, total_pages)
         
         response(True, message, {
             "output": output_file,

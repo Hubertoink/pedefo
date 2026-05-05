@@ -22,8 +22,13 @@ contextBridge.exposeInMainWorld('pedefo', {
             ipcRenderer.invoke('pdf:removePages', inputFile, pages, outputPath),
         rotate: (inputFile, pages, rotation, outputPath) => 
             ipcRenderer.invoke('pdf:rotate', inputFile, pages, rotation, outputPath),
-        compress: (inputFile, outputPath, quality) => 
-            ipcRenderer.invoke('pdf:compress', inputFile, outputPath, quality),
+        compress: (inputFile, outputPath, quality, operationId) => 
+            ipcRenderer.invoke('pdf:compress', inputFile, outputPath, quality, operationId),
+        onCompressProgress: (callback) => {
+            const listener = (_event, payload) => callback(payload);
+            ipcRenderer.on('pdf:compress-progress', listener);
+            return () => ipcRenderer.removeListener('pdf:compress-progress', listener);
+        },
         getInfo: (filePath) => ipcRenderer.invoke('pdf:getInfo', filePath),
         getOutline: (filePath) => ipcRenderer.invoke('pdf:getOutline', filePath),
         getPageCount: (filePath) => ipcRenderer.invoke('pdf:getPageCount', filePath),
