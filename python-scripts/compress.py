@@ -8,6 +8,8 @@ import json
 import os
 import subprocess
 import shutil
+import glob
+import re
 
 
 def response(success, message, data=None):
@@ -48,18 +50,36 @@ def find_ghostscript():
         if gs_path:
             return gs_path
     
-    # Typische Windows-Installationspfade
-    possible_paths = [
-        r"C:\Program Files\gs\gs10.02.1\bin\gswin64c.exe",
-        r"C:\Program Files\gs\gs10.01.2\bin\gswin64c.exe",
-        r"C:\Program Files\gs\gs10.00.0\bin\gswin64c.exe",
-        r"C:\Program Files\gs\gs9.56.1\bin\gswin64c.exe",
-        r"C:\Program Files (x86)\gs\gs9.56.1\bin\gswin32c.exe",
+    # Windows: typische Installationspfade dynamisch scannen (gs10.x etc.)
+    # Beispiel: C:\Program Files\gs\gs10.03.1\bin\gswin64c.exe
+    program_files_candidates = [
+        os.environ.get('ProgramFiles'),
+        os.environ.get('ProgramFiles(x86)'),
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
     ]
-    
-    for path in possible_paths:
-        if os.path.exists(path):
-            return path
+
+    def _version_key(path_str: str):
+        # Extrahiere Version aus ...\gs10.03.1\...
+        m = re.search(r"\\gs(?P<v>\d+(?:\.\d+){1,3})\\", path_str)
+        if not m:
+            return (0, 0, 0, 0)
+        parts = [int(p) for p in m.group('v').split('.') if p.isdigit()]
+        while len(parts) < 4:
+            parts.append(0)
+        return tuple(parts[:4])
+
+    possible_paths = []
+    for base in program_files_candidates:
+        if not base:
+            continue
+        possible_paths.extend(glob.glob(os.path.join(base, 'gs', 'gs*', 'bin', 'gswin64c.exe')))
+        possible_paths.extend(glob.glob(os.path.join(base, 'gs', 'gs*', 'bin', 'gswin32c.exe')))
+
+    possible_paths = [p for p in possible_paths if os.path.exists(p)]
+    if possible_paths:
+        possible_paths.sort(key=_version_key, reverse=True)
+        return possible_paths[0]
     
     return None
 

@@ -121,6 +121,30 @@ ipcMain.on('close-without-save', () => {
 function runPython(script, args) {
     return new Promise((resolve, reject) => {
         let command, commandArgs;
+
+        const getDevPythonCommand = () => {
+            // Allow explicit override (useful for CI and local setups)
+            if (process.env.PEDEFO_PYTHON && fs.existsSync(process.env.PEDEFO_PYTHON)) {
+                return process.env.PEDEFO_PYTHON;
+            }
+
+            // Try common venv locations
+            const candidates = [
+                // repo-root venv (..\.. because this file is in pdf-app/electron-app)
+                path.join(__dirname, '..', '..', '.venv', 'Scripts', 'python.exe'),
+                path.join(__dirname, '..', '..', '.venv', 'bin', 'python'),
+                // pdf-app local venv
+                path.join(__dirname, '..', '.venv', 'Scripts', 'python.exe'),
+                path.join(__dirname, '..', '.venv', 'bin', 'python')
+            ];
+
+            for (const p of candidates) {
+                if (fs.existsSync(p)) return p;
+            }
+
+            // Fallback: rely on PATH
+            return 'python';
+        };
         
         if (isDev) {
             // Development: use python interpreter
@@ -131,7 +155,7 @@ function runPython(script, args) {
                 return;
             }
             
-            command = 'python';
+            command = getDevPythonCommand();
             commandArgs = [scriptPath, ...args];
         } else {
             // Production: use bundled executable
@@ -170,14 +194,75 @@ function runPython(script, args) {
             if (code === 0) {
                 try {
                     // Versuche JSON zu parsen
-                    const result = JSON.parse(stdout.trim());
+                    const trimmed = stdout.trim();
+                    const result = JSON.parse(trimmed);
                     resolve(result);
                 } catch (e) {
-                    // Falls kein JSON, gib rohen Output zurück
-                    resolve({ success: true, message: stdout.trim() });
+                    // Falls stdout zusätzliche Logs enthält: versuche letzte JSON-Zeile
+                    try {
+                        const lines = stdout
+                            .split(/\r?\n/)
+                            .map(l => l.trim())
+                            .filter(Boolean);
+
+                        for (let i = lines.length - 1; i >= 0; i--) {
+                            const line = lines[i];
+                            if ((line.startsWith('{') && line.endsWith('}')) || (line.startsWith('[') && line.endsWith(']'))) {
+                                const parsed = JSON.parse(line);
+                                resolve(parsed);
+                                return;
+                            }
+                        }
+                    } catch (_) {
+                        // ignore and fall through
+                    }
+
+                    // Nicht parsbar => als Fehler zurückgeben (sonst false positives)
+                    resolve({
+                        success: false,
+                        message: 'Python-Ausgabe konnte nicht als JSON geparst werden',
+                        data: {
+                            stdout: stdout.trim(),
+                            stderr: stderr.trim()
+                        }
+                    });
                 }
             } else {
-                reject(new Error(stderr || `Python-Prozess beendet mit Code ${code}`));
+                // Auch bei Fehlern versucht das Backend oft JSON über stdout zu liefern.
+                // Wenn wir das hier parsen, bekommt der Renderer eine bessere Fehlermeldung.
+                const tryParseJsonFromStdout = () => {
+                    const text = (stdout || '').trim();
+                    if (!text) return null;
+                    try {
+                        return JSON.parse(text);
+                    } catch (_) {
+                        // try last JSON line
+                        const lines = stdout
+                            .split(/\r?\n/)
+                            .map(l => l.trim())
+                            .filter(Boolean);
+
+                        for (let i = lines.length - 1; i >= 0; i--) {
+                            const line = lines[i];
+                            if ((line.startsWith('{') && line.endsWith('}')) || (line.startsWith('[') && line.endsWith(']'))) {
+                                try {
+                                    return JSON.parse(line);
+                                } catch (_) {
+                                    // continue
+                                }
+                            }
+                        }
+                        return null;
+                    }
+                };
+
+                const parsed = tryParseJsonFromStdout();
+                if (parsed && typeof parsed === 'object' && 'success' in parsed) {
+                    resolve(parsed);
+                    return;
+                }
+
+                reject(new Error(stderr || stdout || `Python-Prozess beendet mit Code ${code}`));
             }
         });
 
@@ -308,6 +393,16 @@ ipcMain.handle('system:checkGhostscript', async () => {
     }
 });
 
+ipcMain.handle('system:openExternal', async (event, url) => {
+    try {
+        if (!url || typeof url !== 'string') throw new Error('Ungültige URL');
+        await shell.openExternal(url);
+        return { success: true };
+    } catch (error) {
+        return { success: false, message: error.message };
+    }
+});
+
 // Datei-Info
 ipcMain.handle('file:exists', async (event, filePath) => {
     return fs.existsSync(filePath);
@@ -319,6 +414,19 @@ ipcMain.handle('file:getSize', async (event, filePath) => {
         return { success: true, size: stats.size };
     } catch (error) {
         return { success: false, message: error.message };
+    }
+});
+
+ipcMain.handle('file:readBinary', async (event, filePath) => {
+    try {
+        if (!filePath || typeof filePath !== 'string') {
+            throw new Error('Ungültiger Dateipfad');
+        }
+
+        const data = await fs.promises.readFile(filePath);
+        return data;
+    } catch (error) {
+        throw new Error(`Datei konnte nicht gelesen werden: ${error.message}`);
     }
 });
 
@@ -364,6 +472,18 @@ ipcMain.handle('pdf:generateSingleThumbnail', async (event, filePath, pageNumber
         return result;
     } catch (error) {
         console.error('Single thumbnail error:', error);
+        return { success: false, message: error.message };
+    }
+});
+
+// Batch-Thumbnails für mehrere Seiten auf einmal (effizienter)
+ipcMain.handle('pdf:generateBatchThumbnails', async (event, filePath, pageNumbers, dpi = 72) => {
+    try {
+        const args = ['generate_batch', filePath, JSON.stringify(pageNumbers), String(dpi)];
+        const result = await runPython('thumbnails.py', args);
+        return result;
+    } catch (error) {
+        console.error('Batch thumbnail error:', error);
         return { success: false, message: error.message };
     }
 });

@@ -190,6 +190,22 @@
             </div>
             <div class="modal-body">
                 <p class="modal-info">Reduziere die Dateigröße der PDF.</p>
+
+                <div class="notice notice-warning" id="ghostscript-notice" style="display: none;">
+                    <div class="notice-title">Für beste Kompression: Ghostscript installieren</div>
+                    <div class="notice-text">
+                        Ohne Ghostscript ist die Kompression oft kaum wirksam (0%).
+                        <ol class="notice-steps">
+                            <li>Ghostscript herunterladen und installieren</li>
+                            <li>Pedefo neu starten</li>
+                            <li>Dann erneut komprimieren</li>
+                        </ol>
+                    </div>
+                    <div class="notice-actions">
+                        <button class="btn-secondary" id="btn-ghostscript-download" type="button">Download öffnen</button>
+                    </div>
+                </div>
+
                 <div class="quality-options">
                     <label class="quality-option">
                         <input type="radio" name="compress-quality" value="low">

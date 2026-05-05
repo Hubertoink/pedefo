@@ -30,18 +30,21 @@ contextBridge.exposeInMainWorld('pedefo', {
         generateThumbnails: (filePath, dpi) => ipcRenderer.invoke('pdf:generateThumbnails', filePath, dpi),
         generateHighResThumbnails: (filePath) => ipcRenderer.invoke('pdf:generateHighResThumbnails', filePath),
         generateSingleThumbnail: (filePath, pageNumber, dpi) => ipcRenderer.invoke('pdf:generateSingleThumbnail', filePath, pageNumber, dpi),
+        generateBatchThumbnails: (filePath, pageNumbers, dpi) => ipcRenderer.invoke('pdf:generateBatchThumbnails', filePath, pageNumbers, dpi),
         buildPDF: (operations, outputPath) => ipcRenderer.invoke('pdf:buildPDF', operations, outputPath)
     },
     
     // System
     system: {
-        checkGhostscript: () => ipcRenderer.invoke('system:checkGhostscript')
+        checkGhostscript: () => ipcRenderer.invoke('system:checkGhostscript'),
+        openExternal: (url) => ipcRenderer.invoke('system:openExternal', url)
     },
     
     // Datei-Operationen
     file: {
         exists: (filePath) => ipcRenderer.invoke('file:exists', filePath),
         getSize: (filePath) => ipcRenderer.invoke('file:getSize', filePath),
+        readBinary: (filePath) => ipcRenderer.invoke('file:readBinary', filePath),
         openPath: (filePath) => ipcRenderer.invoke('file:openPath', filePath)
     }
 });

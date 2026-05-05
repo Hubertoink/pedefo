@@ -10,8 +10,191 @@ const state = {
     selectedPages: new Set(),
     isDirty: false,
     thumbnailsGenerating: false,  // Lock to prevent parallel thumbnail generation
-    splitPoints: []              // page indices where a split starts (between pages)
+    splitPoints: [],             // page indices where a split starts (between pages)
+    lastFocusedPageId: null      // used to prioritize loading around user focus
 };
+
+// Performance helpers
+let pageIndexById = new Map();
+let renderPagesToken = 0;
+
+const pdfRender = {
+    pdfjsReady: null,
+    documents: new Map(),
+    imageCache: new Map(),
+    pending: new Map(),
+    objectUrls: new Set(),
+    queue: [],
+    active: 0,
+    maxConcurrent: 2,
+    loadToken: 0
+};
+
+// Grid thumbnail visibility tracking (avoids scanning all cards on scroll)
+let gridThumbObserver = null;
+let gridVisiblePageIds = new Set();
+
+// Reader thumbnail visibility tracking
+let readerThumbObserver = null;
+let readerVisibleIndices = new Set();
+
+// ============================================
+// PDF.js Rendering
+// ============================================
+
+function normalizeBinaryData(data) {
+    if (data instanceof Uint8Array) return data;
+    if (data instanceof ArrayBuffer) return new Uint8Array(data);
+    if (data && data.buffer instanceof ArrayBuffer) {
+        return new Uint8Array(data.buffer, data.byteOffset || 0, data.byteLength || data.buffer.byteLength);
+    }
+    if (data && Array.isArray(data.data)) {
+        return new Uint8Array(data.data);
+    }
+    return new Uint8Array(data || []);
+}
+
+async function ensurePdfJs() {
+    if (!pdfRender.pdfjsReady) {
+        pdfRender.pdfjsReady = import('./lib/pdf.mjs').then((pdfjs) => {
+            pdfjs.GlobalWorkerOptions.workerSrc = new URL('./lib/pdf.worker.mjs', window.location.href).href;
+            return pdfjs;
+        });
+    }
+    return pdfRender.pdfjsReady;
+}
+
+async function getPdfDocument(filePath) {
+    if (pdfRender.documents.has(filePath)) {
+        return pdfRender.documents.get(filePath);
+    }
+
+    const pdfjs = await ensurePdfJs();
+    const binary = await window.pedefo.file.readBinary(filePath);
+    const data = normalizeBinaryData(binary);
+    const task = pdfjs.getDocument({
+        data,
+        isEvalSupported: false,
+        useSystemFonts: true
+    });
+    const documentProxy = await task.promise;
+    pdfRender.documents.set(filePath, documentProxy);
+    return documentProxy;
+}
+
+async function getPdfPageCount(filePath) {
+    try {
+        const documentProxy = await getPdfDocument(filePath);
+        return documentProxy.numPages;
+    } catch (error) {
+        const result = await window.pedefo.pdf.getPageCount(filePath);
+        if (!result.success) throw new Error(result.message);
+        return result.data.pages;
+    }
+}
+
+function clearRenderedImages() {
+    for (const url of pdfRender.objectUrls) {
+        URL.revokeObjectURL(url);
+    }
+    pdfRender.objectUrls.clear();
+    pdfRender.imageCache.clear();
+    pdfRender.pending.clear();
+    pdfRender.queue = [];
+}
+
+function getPageRenderKey(page, variant, maxWidth, maxHeight) {
+    return `${page.sourceFile}|${page.originalNumber}|${variant}|${maxWidth}|${maxHeight || 0}`;
+}
+
+function schedulePdfPageRender(page, options = {}) {
+    const variant = options.variant || 'grid';
+    const maxWidth = options.maxWidth || 240;
+    const maxHeight = options.maxHeight || 0;
+    const priority = options.priority || 0;
+    const key = getPageRenderKey(page, variant, maxWidth, maxHeight);
+
+    if (pdfRender.imageCache.has(key)) {
+        return Promise.resolve(pdfRender.imageCache.get(key));
+    }
+    if (pdfRender.pending.has(key)) {
+        return pdfRender.pending.get(key);
+    }
+
+    const promise = new Promise((resolve, reject) => {
+        pdfRender.queue.push({ page, variant, maxWidth, maxHeight, priority, key, resolve, reject });
+        pdfRender.queue.sort((a, b) => b.priority - a.priority);
+        pumpPdfRenderQueue();
+    });
+
+    pdfRender.pending.set(key, promise);
+    promise.then(
+        () => pdfRender.pending.delete(key),
+        () => pdfRender.pending.delete(key)
+    );
+    return promise;
+}
+
+function pumpPdfRenderQueue() {
+    while (pdfRender.active < pdfRender.maxConcurrent && pdfRender.queue.length > 0) {
+        const job = pdfRender.queue.shift();
+        pdfRender.active++;
+
+        renderPdfPageToObjectUrl(job.page, job.maxWidth, job.maxHeight)
+            .then((url) => {
+                pdfRender.imageCache.set(job.key, url);
+                job.resolve(url);
+            })
+            .catch(job.reject)
+            .finally(() => {
+                pdfRender.active--;
+                pumpPdfRenderQueue();
+            });
+    }
+}
+
+async function renderPdfPageToObjectUrl(page, maxWidth, maxHeight) {
+    const documentProxy = await getPdfDocument(page.sourceFile);
+    const pdfPage = await documentProxy.getPage(page.originalNumber);
+    const baseViewport = pdfPage.getViewport({ scale: 1 });
+    const widthScale = maxWidth / baseViewport.width;
+    const heightScale = maxHeight ? maxHeight / baseViewport.height : widthScale;
+    const scale = Math.max(0.1, Math.min(widthScale, heightScale, 2.5));
+    const viewport = pdfPage.getViewport({ scale });
+
+    const canvas = document.createElement('canvas');
+    const context = canvas.getContext('2d', { alpha: false });
+    canvas.width = Math.ceil(viewport.width);
+    canvas.height = Math.ceil(viewport.height);
+
+    context.fillStyle = '#ffffff';
+    context.fillRect(0, 0, canvas.width, canvas.height);
+
+    await pdfPage.render({ canvasContext: context, viewport }).promise;
+
+    const blob = await new Promise((resolve, reject) => {
+        canvas.toBlob((result) => {
+            if (result) resolve(result);
+            else reject(new Error('PDF-Seite konnte nicht gerendert werden'));
+        }, 'image/jpeg', 0.86);
+    });
+
+    canvas.width = 0;
+    canvas.height = 0;
+
+    const url = URL.createObjectURL(blob);
+    pdfRender.objectUrls.add(url);
+    return url;
+}
+
+function getViewerRenderBounds() {
+    const content = document.querySelector('.page-viewer-content');
+    if (!content) return { maxWidth: 1400, maxHeight: 1800 };
+    const rect = content.getBoundingClientRect();
+    const maxWidth = Math.max(900, Math.min(1800, Math.floor(rect.width * 1.5)));
+    const maxHeight = Math.max(1000, Math.min(2200, Math.floor(rect.height * 1.5)));
+    return { maxWidth, maxHeight };
+}
 
 // ============================================
 // Utility Functions
@@ -140,17 +323,13 @@ function setupUploadZone() {
 // ============================================
 
 async function loadPDF(filePath) {
+    const loadToken = ++pdfRender.loadToken;
     showLoading('Lade PDF...');
     
     try {
-        // Get page count
-        const result = await window.pedefo.pdf.getPageCount(filePath);
-        
-        if (!result.success) {
-            throw new Error(result.message);
-        }
-        
-        const pageCount = result.data.pages;
+        clearRenderedImages();
+        const pageCount = await getPdfPageCount(filePath);
+        if (loadToken !== pdfRender.loadToken) return;
         
         state.currentFile = filePath;
         state.pages = [];
@@ -171,6 +350,8 @@ async function loadPDF(filePath) {
                 thumbnail: null
             });
         }
+
+        rebuildPageIndexById();
         
         // Update UI
         document.getElementById('current-file-name').textContent = getBaseName(filePath);
@@ -178,7 +359,7 @@ async function loadPDF(filePath) {
         renderPages();
         showScreen('screen-editor');
         
-        // Generate thumbnails with Poppler
+        // Generate thumbnails with PDF.js render queue
         generateThumbnailsWithPoppler(filePath);
         
         showToast(`${pageCount} Seiten geladen`, 'success');
@@ -187,6 +368,13 @@ async function loadPDF(filePath) {
         showToast(error.message, 'error');
     } finally {
         hideLoading();
+    }
+}
+
+function rebuildPageIndexById() {
+    pageIndexById = new Map();
+    for (let i = 0; i < state.pages.length; i++) {
+        pageIndexById.set(state.pages[i].id, i);
     }
 }
 
@@ -224,62 +412,140 @@ function scheduleGridThumbnailLoad() {
 
 function loadVisibleThumbnails() {
     const visiblePages = getVisiblePagesInGrid();
-    let started = 0;
+    if (visiblePages.length === 0) return;
+
+    // Prioritize pages around current focus (or center of visible range)
+    let focusIndex = (state.lastFocusedPageId && pageIndexById.has(state.lastFocusedPageId))
+        ? pageIndexById.get(state.lastFocusedPageId)
+        : null;
+    if (focusIndex === null) {
+        const mid = visiblePages[Math.floor(visiblePages.length / 2)];
+        focusIndex = mid?.index ?? 0;
+    }
+
+    visiblePages.sort((a, b) => {
+        const da = Math.abs(a.index - focusIndex);
+        const db = Math.abs(b.index - focusIndex);
+        if (da !== db) return da - db;
+        return a.index - b.index;
+    });
+
+    // Collect pages to load in batch (up to 16 at once)
+    const toLoad = [];
     for (const pageInfo of visiblePages) {
-        if (started >= 6) break; // Limit parallele Loads
-        const page = state.pages.find(p => p.id === pageInfo.id);
+        if (toLoad.length >= 16) break;
+        const page = state.pages[pageInfo.index];
         if (!page) continue;
         if (page.thumbnail) continue;
         if (gridThumbLoading.has(page.id)) continue;
         const cfg = gridThumbConfig[page.sourceFile];
         if (!cfg) continue;
-        gridThumbLoading.add(page.id);
-        started++;
-        loadGridThumbnail(page, cfg.dpi, cfg.total)
-            .finally(() => gridThumbLoading.delete(page.id));
+        toLoad.push({ page, cfg, index: pageInfo.index });
+    }
+
+    if (toLoad.length === 0) return;
+
+    // Group by sourceFile for batch loading
+    const bySource = {};
+    for (const item of toLoad) {
+        const key = item.page.sourceFile;
+        if (!bySource[key]) bySource[key] = { cfg: item.cfg, pages: [] };
+        bySource[key].pages.push(item.page);
+        gridThumbLoading.add(item.page.id);
+    }
+
+    // Load each source as a batch
+    for (const [sourceFile, { cfg, pages }] of Object.entries(bySource)) {
+        const pageNumbers = pages.map(p => p.originalNumber);
+        loadGridThumbnailBatch(sourceFile, pageNumbers, pages, cfg.dpi, cfg.total)
+            .finally(() => pages.forEach(p => gridThumbLoading.delete(p.id)));
     }
 }
 
 function getVisiblePagesInGrid() {
     const container = document.getElementById('pages-container');
     if (!container) return [];
+
+    // Fast path: IntersectionObserver maintains a set of visible page ids
+    if (gridThumbObserver) {
+        const out = [];
+        for (const id of gridVisiblePageIds) {
+            const idx = pageIndexById.get(id);
+            if (typeof idx === 'number') out.push({ id, index: idx });
+        }
+        return out;
+    }
+
+    // Fallback path: compute visibility by scanning cards (slower)
+    const containerRect = container.getBoundingClientRect();
     const visiblePages = [];
-    const buffer = 200; // px buffer
+    const buffer = 300;
+
     document.querySelectorAll('.page-card').forEach(card => {
         const rect = card.getBoundingClientRect();
         const pageId = card.dataset.pageId;
-        const isVisible = rect.bottom > -buffer && rect.top < window.innerHeight + buffer;
-        if (isVisible && pageId) {
-            const index = state.pages.findIndex(p => p.id === pageId);
-            if (index !== -1) visiblePages.push({ id: pageId, index });
-        }
+        const isVisible = rect.bottom > containerRect.top - buffer && rect.top < containerRect.bottom + buffer;
+        if (!isVisible || !pageId) return;
+        const index = pageIndexById.get(pageId);
+        if (typeof index === 'number') visiblePages.push({ id: pageId, index });
     });
-    // Sort by index to load in reading order
-    visiblePages.sort((a, b) => a.index - b.index);
+
     return visiblePages;
+}
+
+function attachGridThumbnailObserver() {
+    const container = document.getElementById('pages-container');
+    if (!container) return;
+
+    // Reset
+    if (gridThumbObserver) {
+        gridThumbObserver.disconnect();
+        gridThumbObserver = null;
+    }
+    gridVisiblePageIds = new Set();
+
+    if (!('IntersectionObserver' in window)) {
+        return; // will use fallback scanning
+    }
+
+    gridThumbObserver = new IntersectionObserver(
+        (entries) => {
+            let changed = false;
+            for (const entry of entries) {
+                const id = entry.target?.dataset?.pageId;
+                if (!id) continue;
+                if (entry.isIntersecting) {
+                    if (!gridVisiblePageIds.has(id)) {
+                        gridVisiblePageIds.add(id);
+                        changed = true;
+                    }
+                } else {
+                    if (gridVisiblePageIds.delete(id)) changed = true;
+                }
+            }
+            if (changed) scheduleGridThumbnailLoad();
+        },
+        {
+            root: container,
+            rootMargin: '400px 0px',
+            threshold: 0.01
+        }
+    );
+
+    document.querySelectorAll('.page-card').forEach(card => gridThumbObserver.observe(card));
 }
 
 async function generateThumbnailsWithPoppler(filePath) {
     // Verhindere parallele Thumbnail-Generierung
-    if (state.thumbnailsGenerating) {
-        return;
-    }
-    
+    if (state.thumbnailsGenerating) return;
     state.thumbnailsGenerating = true;
-    
+
     try {
-        // Zeige Fortschrittsbalken
-        showThumbnailProgress('Lade Vorschau...', 0);
-        
-        // Ermittle DPI basierend auf Seitenzahl
-        const pageCount = state.pages.filter(p => p.sourceFile === filePath).length;
+        const total = state.pages.filter(p => p.sourceFile === filePath).length;
         let dpi = 36;
-        if (pageCount > 200) {
-            dpi = 24;  // Sehr niedrige DPI für große Dokumente
-        } else if (pageCount > 100) {
-            dpi = 30;
-        }
-        const total = pageCount;
+        if (total > 200) dpi = 24;
+        else if (total > 100) dpi = 30;
+
         gridThumbConfig[filePath] = { dpi, total };
 
         // Erst sichtbare Seiten laden
@@ -288,7 +554,7 @@ async function generateThumbnailsWithPoppler(filePath) {
         // Scroll-Handler einmalig anhängen
         attachGridScrollHandler();
 
-        // Hintergrund-Lader als Fallback: alle 400ms einen Versuch
+        // Hintergrund-Lader als Fallback: alle 1000ms einen Versuch
         const bgInterval = setInterval(() => {
             const remaining = state.pages.some(p => p.sourceFile === filePath && !p.thumbnail);
             if (!remaining) {
@@ -297,8 +563,7 @@ async function generateThumbnailsWithPoppler(filePath) {
                 return;
             }
             scheduleGridThumbnailLoad();
-        }, 400);
-        
+        }, 1000);
     } catch (error) {
         hideThumbnailProgress();
     } finally {
@@ -308,76 +573,121 @@ async function generateThumbnailsWithPoppler(filePath) {
 
 async function loadGridThumbnail(page, dpi, totalPages) {
     try {
-        const result = await window.pedefo.pdf.generateSingleThumbnail(
-            page.sourceFile, 
-            page.originalNumber, 
-            dpi
-        );
-        
-        if (result.success && result.data) {
-            page.thumbnail = result.data.data;
-            
-            // Update thumbnail in DOM sofort
-            const pageEl = document.querySelector(`[data-page-id="${page.id}"] .page-thumbnail`);
-            if (pageEl) {
-                pageEl.innerHTML = `<img src="${result.data.data}" alt="Seite ${page.number}">`;
-            }
-            
-            // Fortschritt aktualisieren
-            const loadedCount = state.pages.filter(p => p.sourceFile === page.sourceFile && p.thumbnail).length;
-            updateThumbnailProgress(loadedCount, totalPages);
+        const url = await schedulePdfPageRender(page, {
+            variant: 'grid',
+            maxWidth: dpi >= 72 ? 360 : 240,
+            priority: 20
+        });
+
+        page.thumbnail = url;
+
+        // Update thumbnail in DOM sofort
+        const pageEl = document.querySelector(`[data-page-id="${page.id}"] .page-thumbnail`);
+        if (pageEl) {
+            pageEl.innerHTML = `<img src="${url}" alt="Seite ${page.number}" style="transform: rotate(${page.rotation}deg)">`;
         }
+
+        // Fortschritt aktualisieren
+        const loadedCount = state.pages.filter(p => p.sourceFile === page.sourceFile && p.thumbnail).length;
+        updateThumbnailProgress(loadedCount, totalPages);
     } catch (error) {
         // stille Fehler – nicht spammen
     }
 }
 
-function getVisiblePagesInGrid() {
+async function loadGridThumbnailBatch(sourceFile, pageNumbers, pages, dpi, totalPages) {
+    try {
+        await Promise.all(pages.map(async (page, index) => {
+            const url = await schedulePdfPageRender(page, {
+                variant: 'grid',
+                maxWidth: dpi >= 72 ? 360 : 240,
+                priority: 30 - index
+            });
+
+            page.thumbnail = url;
+            const pageEl = document.querySelector(`[data-page-id="${page.id}"] .page-thumbnail`);
+            if (pageEl) {
+                pageEl.innerHTML = `<img src="${url}" alt="Seite ${page.number}" style="transform: rotate(${page.rotation}deg)">`;
+            }
+        }));
+
+        const loadedCount = state.pages.filter(p => p.sourceFile === sourceFile && p.thumbnail).length;
+        updateThumbnailProgress(loadedCount, totalPages);
+    } catch (error) {
+        // Fallback to single loading on batch failure
+        for (const page of pages) {
+            loadGridThumbnail(page, dpi, totalPages);
+        }
+    }
+}
+
+function getVisiblePagesInGridLegacy() {
     const container = document.getElementById('pages-container');
     if (!container) return [];
-    
+
     const containerRect = container.getBoundingClientRect();
     const visiblePages = [];
-    
+
     document.querySelectorAll('.page-card').forEach(card => {
         const rect = card.getBoundingClientRect();
         const pageId = card.dataset.pageId;
-        
-        // Prüfe ob Seite im Viewport ist (mit etwas Buffer)
-        const isVisible = rect.bottom > -200 && rect.top < window.innerHeight + 200;
-        
-        if (isVisible && pageId) {
-            const index = state.pages.findIndex(p => p.id === pageId);
-            if (index !== -1) {
-                visiblePages.push({ id: pageId, index });
-            }
-        }
+        const isVisible = rect.bottom > containerRect.top - 200 && rect.top < containerRect.bottom + 200;
+        if (!isVisible || !pageId) return;
+
+        const index = pageIndexById.get(pageId);
+        if (typeof index === 'number') visiblePages.push({ id: pageId, index });
     });
-    
+
     return visiblePages;
 }
 
 function renderPages() {
     const container = document.getElementById('pages-container');
+    if (!container) return;
+
+    rebuildPageIndexById();
+
+    // Cancel any in-flight progressive render
+    const myToken = ++renderPagesToken;
     container.innerHTML = '';
-    
-    state.pages.forEach((page, index) => {
-        // Insert zone before first page
-        if (index === 0) {
-            const insertZone = createInsertZone(0);
-            container.appendChild(insertZone);
+
+    const total = state.pages.length;
+    const batchSize = total > 400 ? 20 : 60;
+    let index = 0;
+
+    const renderBatch = () => {
+        if (myToken !== renderPagesToken) return;
+
+        const frag = document.createDocumentFragment();
+        let added = 0;
+        while (added < batchSize && index < total) {
+            // Insert zone before first page
+            if (index === 0) {
+                frag.appendChild(createInsertZone(0));
+            }
+
+            const page = state.pages[index];
+            frag.appendChild(createPageCard(page, index));
+            frag.appendChild(createInsertZone(index + 1));
+
+            index++;
+            added++;
         }
-        
-        const pageCard = createPageCard(page, index);
-        container.appendChild(pageCard);
-        
-        // Insert zone after each page
-        const insertZone = createInsertZone(index + 1);
-        container.appendChild(insertZone);
-    });
-    
-    updateSelectionBar();
-    updateSplitIndicators();
+
+        container.appendChild(frag);
+
+        if (index < total) {
+            requestAnimationFrame(renderBatch);
+        } else {
+            updateSelectionBar();
+            updateSplitIndicators();
+            attachGridThumbnailObserver();
+            scheduleGridThumbnailLoad();
+        }
+    };
+
+    // Kick off progressive render (keeps UI responsive on huge PDFs)
+    requestAnimationFrame(renderBatch);
 }
 
 function createPageCard(page, index) {
@@ -437,6 +747,8 @@ function createPageCard(page, index) {
     // Click to select (additive by default)
     card.addEventListener('click', (e) => {
         if (e.target.closest('.page-actions')) return;
+
+        state.lastFocusedPageId = page.id;
         
         if (e.shiftKey && state.selectedPages.size > 0) {
             // Shift-click for range selection
@@ -896,13 +1208,7 @@ async function insertPDFAt(insertIndex) {
     
     try {
         const filePath = files[0];
-        const result = await window.pedefo.pdf.getPageCount(filePath);
-        
-        if (!result.success) {
-            throw new Error(result.message);
-        }
-        
-        const pageCount = result.data.pages;
+        const pageCount = await getPdfPageCount(filePath);
         const newPages = [];
         
         for (let i = 1; i <= pageCount; i++) {
@@ -924,7 +1230,7 @@ async function insertPDFAt(insertIndex) {
         updateStatusBar();
         hideLoading();
         
-        // Generate thumbnails for new pages mit Fortschrittsbalken
+        // Generate thumbnails for visible inserted pages
         await generateThumbnailsForPages(filePath, insertIndex, pageCount);
         
         showToast(`${pageCount} Seiten eingefügt`, 'success');
@@ -944,38 +1250,14 @@ async function generateThumbnailsForPages(filePath, startIndex, count) {
     state.thumbnailsGenerating = true;
     
     try {
-        console.log('Generiere Thumbnails für eingefügte Seiten...');
-        
-        // Fortschrittsbalken anzeigen
-        showThumbnailProgress('Lade Vorschau...', 0);
-        
-        // Nutze Python-Script mit Poppler
-        const result = await window.pedefo.pdf.generateThumbnails(filePath);
-        
-        if (!result.success) {
-            console.log('Thumbnail-Generierung fehlgeschlagen:', result.message);
-            hideThumbnailProgress();
-            return;
-        }
-        
-        // Thumbnails zuweisen (ab startIndex) mit Fortschrittsanzeige
-        result.data.thumbnails.forEach((thumb, i) => {
-            const pageIndex = startIndex + i;
-            if (state.pages[pageIndex]) {
-                state.pages[pageIndex].thumbnail = thumb.data;
-                
-                // Fortschritt aktualisieren
-                updateThumbnailProgress(i + 1, count);
-                
-                const pageEl = document.querySelector(`[data-page-id="${state.pages[pageIndex].id}"] .page-thumbnail`);
-                if (pageEl) {
-                    pageEl.innerHTML = `<img src="${thumb.data}" alt="Seite ${pageIndex + 1}">`;
-                }
-            }
-        });
-        
-        // Fortschrittsbalken ausblenden
-        setTimeout(hideThumbnailProgress, 300);
+        const total = state.pages.filter(p => p.sourceFile === filePath).length;
+        let dpi = 36;
+        if (total > 200) dpi = 24;
+        else if (total > 100) dpi = 30;
+
+        gridThumbConfig[filePath] = { dpi, total };
+        attachGridScrollHandler();
+        scheduleGridThumbnailLoad();
     } catch (error) {
         console.log('Thumbnail generation failed:', error);
         hideThumbnailProgress();
@@ -1106,6 +1388,37 @@ async function extractPages() {
 
 function openCompressModal() {
     showModal('compress');
+    updateGhostscriptNotice();
+}
+
+async function updateGhostscriptNotice() {
+    const notice = document.getElementById('ghostscript-notice');
+    const downloadBtn = document.getElementById('btn-ghostscript-download');
+    if (!notice || !downloadBtn) return;
+
+    // Avoid stacking multiple listeners if modal opened repeatedly
+    if (!downloadBtn.dataset.bound) {
+        downloadBtn.dataset.bound = '1';
+        downloadBtn.addEventListener('click', async () => {
+            const url = 'https://ghostscript.com/releases/gsdnld.html';
+            const res = await window.pedefo.system.openExternal(url);
+            if (!res?.success) {
+                showToast(res?.message || 'Konnte Browser nicht öffnen', 'error');
+            }
+        });
+    }
+
+    try {
+        const result = await window.pedefo.system.checkGhostscript();
+        if (result?.success) {
+            notice.style.display = 'none';
+        } else {
+            notice.style.display = 'block';
+        }
+    } catch (_) {
+        // If the check fails, show the notice (better to guide than to stay silent)
+        notice.style.display = 'block';
+    }
 }
 
 async function compressPDF() {
@@ -1120,7 +1433,9 @@ async function compressPDF() {
     
     try {
         // First save current state, then compress
-        const tempPath = outputPath.replace('.pdf', '_temp.pdf');
+        const tempPath = /\.pdf$/i.test(outputPath)
+            ? outputPath.replace(/\.pdf$/i, '_temp.pdf')
+            : `${outputPath}_temp.pdf`;
         
         // Build current document
         const operations = [];
@@ -1156,8 +1471,24 @@ async function compressPDF() {
         }
         
         if (result.success) {
-            const reduction = result.data?.reduction_percent || 0;
-            showToast(`PDF komprimiert (${reduction}% kleiner)`, 'success');
+            const reduction = (typeof result.data?.reduction_percent === 'number')
+                ? result.data.reduction_percent
+                : null;
+            const originalMb = result.data?.original_size_mb;
+            const newMb = result.data?.new_size_mb;
+            const msg = result.message || '';
+
+            if (reduction === null) {
+                showToast('PDF komprimiert', 'success');
+            } else if (reduction > 0) {
+                showToast(`PDF komprimiert (${reduction}% kleiner)`, 'success');
+            } else {
+                const sizeText = (typeof originalMb === 'number' && typeof newMb === 'number')
+                    ? ` (${originalMb}→${newMb} MB)`
+                    : '';
+                const gsHint = /ghostscript/i.test(msg) ? ' – Ghostscript nicht verfügbar' : '';
+                showToast(`Keine Größenreduktion erzielt${sizeText}${gsHint}`, 'info');
+            }
         } else {
             throw new Error(result.message);
         }
@@ -1210,6 +1541,16 @@ let readerThumbLoading = new Set(); // currently loading reader thumbs
 let readerThumbLoadScheduled = false;
 let readerThumbScrollAttached = false;
 let outlineCache = {};             // Cache: { sourceFile: outline[] }
+let readerNavToken = 0;            // increments on each page navigation; used to ignore stale async updates
+
+function scrollReaderThumbToIndex(index, behavior = 'auto') {
+    const container = document.getElementById('reader-thumbnails');
+    if (!container) return;
+    const el = container.querySelector(`.reader-thumb[data-index="${index}"]`);
+    if (el) {
+        el.scrollIntoView({ behavior, block: 'center', inline: 'nearest' });
+    }
+}
 
 async function openReaderView(startPageIndex = 0) {
     readerCurrentPage = startPageIndex;
@@ -1222,6 +1563,9 @@ async function openReaderView(startPageIndex = 0) {
     
     // Screen wechseln (keine Verzögerung mehr!)
     showScreen('screen-reader');
+
+    // Nach Screen-Wechsel sicher zum Fokus-Thumbnail scrollen (sonst lädt es oft oben)
+    requestAnimationFrame(() => scrollReaderThumbToIndex(readerCurrentPage, 'auto'));
 
     // Inhaltsverzeichnis laden (asynchron)
     loadOutlineForSources();
@@ -1289,8 +1633,8 @@ function renderReaderThumbnails() {
     // Outline-Panel mit aktueller Reihenfolge synchronisieren
     renderOutlinePanel();
 
-    // Reader-Thumb Lazy-Loading anstoßen
-    attachReaderThumbScrollHandler();
+    // Reader-Thumb Lazy-Loading mit IntersectionObserver
+    attachReaderThumbObserver();
     scheduleReaderThumbLoad();
 }
 
@@ -1311,6 +1655,49 @@ function attachReaderThumbScrollHandler() {
     readerThumbScrollAttached = true;
 }
 
+function attachReaderThumbObserver() {
+    const container = document.getElementById('reader-thumbnails');
+    if (!container) return;
+
+    // Reset existing observer
+    if (readerThumbObserver) {
+        readerThumbObserver.disconnect();
+        readerThumbObserver = null;
+    }
+    readerVisibleIndices = new Set();
+
+    if (!('IntersectionObserver' in window)) {
+        attachReaderThumbScrollHandler();
+        return;
+    }
+
+    readerThumbObserver = new IntersectionObserver(
+        (entries) => {
+            let changed = false;
+            for (const entry of entries) {
+                const idx = parseInt(entry.target?.dataset?.index, 10);
+                if (Number.isNaN(idx)) continue;
+                if (entry.isIntersecting) {
+                    if (!readerVisibleIndices.has(idx)) {
+                        readerVisibleIndices.add(idx);
+                        changed = true;
+                    }
+                } else {
+                    if (readerVisibleIndices.delete(idx)) changed = true;
+                }
+            }
+            if (changed) scheduleReaderThumbLoad();
+        },
+        {
+            root: container,
+            rootMargin: '600px 0px',
+            threshold: 0.01
+        }
+    );
+
+    document.querySelectorAll('.reader-thumb').forEach(el => readerThumbObserver.observe(el));
+}
+
 function scheduleReaderThumbLoad() {
     if (readerThumbLoadScheduled) return;
     readerThumbLoadScheduled = true;
@@ -1321,10 +1708,16 @@ function scheduleReaderThumbLoad() {
 }
 
 function getVisibleReaderThumbs() {
+    // Fast path: use IntersectionObserver tracking
+    if (readerThumbObserver && readerVisibleIndices.size > 0) {
+        return Array.from(readerVisibleIndices).sort((a, b) => a - b);
+    }
+
+    // Fallback: scan DOM (slower)
     const container = document.getElementById('reader-thumbnails');
     if (!container) return [];
     const containerRect = container.getBoundingClientRect();
-    const buffer = 600; // Größerer Buffer für besseres Preloading
+    const buffer = 600;
     const items = [];
     document.querySelectorAll('.reader-thumb').forEach((el) => {
         const rect = el.getBoundingClientRect();
@@ -1339,37 +1732,91 @@ function getVisibleReaderThumbs() {
 async function loadVisibleReaderThumbs() {
     const visible = getVisibleReaderThumbs();
     if (visible.length === 0) return;
-    let started = 0;
+
+    // Prioritize around current reader page
+    const center = readerCurrentPage;
+    visible.sort((a, b) => {
+        const da = Math.abs(a - center);
+        const db = Math.abs(b - center);
+        if (da !== db) return da - db;
+        return a - b;
+    });
+
+    // Collect pages to load (up to 12)
+    const toLoad = [];
     for (const idx of visible) {
-        if (started >= 8) break; // Erhöhte Parallelität für schnelleres Laden
+        if (toLoad.length >= 12) break;
         const page = state.pages[idx];
         if (!page) continue;
         if (readerThumbLoading.has(page.id)) continue;
-        
-        // Prüfe ob Sidebar-Thumbnail bereits geladen ist
+
+        // Check if already loaded
         const thumbWrapper = document.querySelector(`.reader-thumb[data-index="${idx}"]`);
         const imgEl = thumbWrapper?.querySelector('img');
-        if (imgEl && imgEl.src && imgEl.src.startsWith('data:')) continue;
-        
-        const dpi = getThumbDpiForSource(page.sourceFile);
-        readerThumbLoading.add(page.id);
-        started++;
-        loadReaderThumbnail(page, dpi)
-            .finally(() => readerThumbLoading.delete(page.id));
+        if (imgEl && imgEl.src && (imgEl.src.startsWith('data:') || imgEl.src.startsWith('blob:'))) continue;
+
+        toLoad.push({ page, idx });
+    }
+
+    if (toLoad.length === 0) return;
+
+    // Group by sourceFile for batch loading
+    const bySource = {};
+    for (const item of toLoad) {
+        const key = item.page.sourceFile;
+        if (!bySource[key]) bySource[key] = [];
+        bySource[key].push(item);
+        readerThumbLoading.add(item.page.id);
+    }
+
+    for (const [sourceFile, items] of Object.entries(bySource)) {
+        const pageNumbers = items.map(i => i.page.originalNumber);
+        const dpi = getThumbDpiForSource(sourceFile);
+        loadReaderThumbnailBatch(sourceFile, pageNumbers, items, dpi)
+            .finally(() => items.forEach(i => readerThumbLoading.delete(i.page.id)));
     }
 }
 
 async function loadReaderThumbnail(page, dpi) {
     try {
-        const result = await window.pedefo.pdf.generateSingleThumbnail(
-            page.sourceFile,
-            page.originalNumber,
-            dpi
-        );
+        const url = await schedulePdfPageRender(page, {
+            variant: 'reader-thumb',
+            maxWidth: dpi >= 72 ? 360 : 240,
+            priority: 15
+        });
 
-        if (result.success && result.data) {
-            // Sidebar Thumbnail aktualisieren
-            const idx = state.pages.indexOf(page);
+        // Sidebar Thumbnail aktualisieren
+        const idx = state.pages.indexOf(page);
+        const thumbWrapper = document.querySelector(`.reader-thumb[data-index="${idx}"]`);
+        if (thumbWrapper) {
+            let imgEl = thumbWrapper.querySelector('img');
+            if (!imgEl) {
+                imgEl = document.createElement('img');
+                thumbWrapper.innerHTML = '';
+                thumbWrapper.appendChild(imgEl);
+                const numberBadge = document.createElement('span');
+                numberBadge.className = 'reader-thumb-number';
+                numberBadge.textContent = `${idx + 1}`;
+                thumbWrapper.appendChild(numberBadge);
+            }
+            imgEl.src = url;
+            imgEl.style.transform = `rotate(${page.rotation}deg)`;
+            imgEl.alt = `Seite ${idx + 1}`;
+        }
+    } catch (error) {
+        console.error(`Error loading reader thumbnail for page ${page.originalNumber}:`, error);
+    }
+}
+
+async function loadReaderThumbnailBatch(sourceFile, pageNumbers, items, dpi) {
+    try {
+        await Promise.all(items.map(async ({ page, idx }, itemIndex) => {
+            const url = await schedulePdfPageRender(page, {
+                variant: 'reader-thumb',
+                maxWidth: dpi >= 72 ? 360 : 240,
+                priority: 18 - itemIndex
+            });
+
             const thumbWrapper = document.querySelector(`.reader-thumb[data-index="${idx}"]`);
             if (thumbWrapper) {
                 let imgEl = thumbWrapper.querySelector('img');
@@ -1382,15 +1829,16 @@ async function loadReaderThumbnail(page, dpi) {
                     numberBadge.textContent = `${idx + 1}`;
                     thumbWrapper.appendChild(numberBadge);
                 }
-                imgEl.src = result.data.data;
+                imgEl.src = url;
                 imgEl.style.transform = `rotate(${page.rotation}deg)`;
                 imgEl.alt = `Seite ${idx + 1}`;
             }
-        } else {
-            console.warn(`Failed to load reader thumbnail for page ${page.originalNumber}: ${result.message}`);
-        }
+        }));
     } catch (error) {
-        console.error(`Error loading reader thumbnail for page ${page.originalNumber}:`, error);
+        // Fallback to single loading
+        for (const { page } of items) {
+            loadReaderThumbnail(page, dpi);
+        }
     }
 }
 
@@ -1527,7 +1975,7 @@ function createReaderInsertZone(insertIndex) {
     return zone;
 }
 
-async function loadSingleHighResThumbnail(page) {
+async function loadSingleHighResThumbnail(page, navToken = null) {
     // Prüfe ob bereits im Cache
     const cache = readerHighResThumbnails[page.sourceFile];
     if (cache && cache[page.originalNumber]) return;
@@ -1544,31 +1992,70 @@ async function loadSingleHighResThumbnail(page) {
     }
     
     try {
-        const result = await window.pedefo.pdf.generateSingleThumbnail(
-            page.sourceFile, 
-            page.originalNumber, 
-            dpi
-        );
+        const url = await schedulePdfPageRender(page, {
+            variant: 'reader-page',
+            maxWidth: dpi >= 100 ? 1400 : 1100,
+            maxHeight: dpi >= 100 ? 1800 : 1500,
+            priority: 90
+        });
         
-        if (result.success && result.data) {
-            // Cache initialisieren wenn nötig
-            if (!readerHighResThumbnails[page.sourceFile]) {
-                readerHighResThumbnails[page.sourceFile] = {};
+        // Abbrechen wenn Navigation sich geändert hat
+        if (navToken !== null && navToken !== readerNavToken) return;
+        
+        // Cache initialisieren wenn nötig
+        if (!readerHighResThumbnails[page.sourceFile]) {
+            readerHighResThumbnails[page.sourceFile] = {};
+        }
+        readerHighResThumbnails[page.sourceFile][page.originalNumber] = url;
+        
+        // Anzeige nur aktualisieren, wenn diese Seite noch aktiv ist (check by id)
+        const currentPage = state.pages[readerCurrentPage];
+        if (currentPage && currentPage.id === page.id) {
+            const img = document.getElementById('reader-page-image');
+            if (img) {
+                img.src = url;
+                img.style.display = 'block';
             }
-            readerHighResThumbnails[page.sourceFile][page.originalNumber] = result.data.data;
-            
-            // Aktualisiere Anzeige wenn diese Seite gerade angezeigt wird
-            const currentPage = state.pages[readerCurrentPage];
-            if (currentPage && 
-                currentPage.sourceFile === page.sourceFile && 
-                currentPage.originalNumber === page.originalNumber) {
-                showReaderPage(readerCurrentPage);
-            }
-        } else {
-            console.warn(`Failed to load high-res for page ${page.originalNumber}: ${result.message}`);
         }
     } catch (error) {
         console.error(`Error loading high-res for page ${page.originalNumber}:`, error);
+    }
+}
+
+async function loadSingleMediumResThumbnail(page, navToken = null) {
+    // Medium-res is used as a fast fallback when no thumbnail is available yet
+    if (page.thumbnail) return;
+
+    let dpi = 72;
+    const pagesFromSameSource = state.pages.filter(p => p.sourceFile === page.sourceFile);
+    const maxOriginalPage = Math.max(...pagesFromSameSource.map(p => p.originalNumber));
+    if (maxOriginalPage > 200) dpi = 60;
+    else if (maxOriginalPage > 100) dpi = 66;
+
+    try {
+        const url = await schedulePdfPageRender(page, {
+            variant: 'reader-medium',
+            maxWidth: dpi >= 72 ? 900 : 760,
+            maxHeight: dpi >= 72 ? 1200 : 1000,
+            priority: 80
+        });
+
+        // Abbrechen wenn Navigation sich geändert hat
+        if (navToken !== null && navToken !== readerNavToken) return;
+
+        page.thumbnail = url;
+
+        // Update main reader image if still on this page (check by id)
+        const currentPage = state.pages[readerCurrentPage];
+        if (currentPage && currentPage.id === page.id) {
+            const img = document.getElementById('reader-page-image');
+            if (img) {
+                img.src = url;
+                img.style.display = 'block';
+            }
+        }
+    } catch (error) {
+        // ignore
     }
 }
 
@@ -1587,9 +2074,13 @@ function showReaderLoading(show) {
 
 function showReaderPage(index) {
     if (index < 0 || index >= state.pages.length) return;
-    
+    const myToken = ++readerNavToken;
+
     readerCurrentPage = index;
     const page = state.pages[index];
+
+    // Keep a global focus hint so grid thumbnail loading can prioritize nearby pages
+    state.lastFocusedPageId = page.id;
 
     // Sicherstellen, dass sichtbare Sidebar-Thumbnails geladen werden
     scheduleReaderThumbLoad();
@@ -1601,14 +2092,15 @@ function showReaderPage(index) {
     const highResCache = readerHighResThumbnails[page.sourceFile];
     const highRes = highResCache ? highResCache[page.originalNumber] : null;
     const thumbnail = highRes || page.thumbnail;
-    
+
     if (thumbnail) {
         img.src = thumbnail;
         img.style.display = 'block';
     } else {
-        // Kein Thumbnail verfügbar - zeige leeres Bild
+        // Kein Thumbnail verfügbar - zeige Platzhalter, lade schnell medium-res nach
         img.src = '';
         img.style.display = 'block';
+        loadSingleMediumResThumbnail(page, myToken);
     }
     img.style.transform = `rotate(${page.rotation}deg)`;
     
@@ -1628,31 +2120,31 @@ function showReaderPage(index) {
     // Thumbnail in Sicht scrollen
     const activeThumb = document.querySelector(`.reader-thumb[data-index="${index}"]`);
     if (activeThumb) {
-        activeThumb.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+        activeThumb.scrollIntoView({ behavior: 'auto', block: 'nearest' });
     }
     
     // Outline-Hervorhebung aktualisieren
     highlightOutlineForPage(index);
 
     // Lade High-Res für aktuelle und umliegende Seiten (falls nicht im Cache)
-    loadPriorityThumbnails(index);
+    loadPriorityThumbnails(index, myToken);
 }
 
 // Lädt Thumbnails für aktuelle und umliegende Seiten priorisiert
-async function loadPriorityThumbnails(centerIndex) {
+async function loadPriorityThumbnails(centerIndex, token) {
     const page = state.pages[centerIndex];
     if (!page) return;
+
+    // Ignore stale requests
+    if (token !== undefined && token !== readerNavToken) return;
     
     // Prüfe ob aktuelle Seite bereits High-Res hat
     const cache = readerHighResThumbnails[page.sourceFile];
     const hasHighRes = cache && cache[page.originalNumber];
-    
+
+    // High-res für aktuelle Seite im Hintergrund (nicht blockierend)
     if (!hasHighRes) {
-        // Zeige Loading für diese Seite
-        showReaderLoading(true);
-        await loadSingleHighResThumbnail(page);
-        showReaderPage(centerIndex);
-        showReaderLoading(false);
+        loadSingleHighResThumbnail(page, token);
     }
     
     // Lade umliegende Seiten PARALLEL im Hintergrund (±5 Seiten)
@@ -1669,12 +2161,13 @@ async function loadPriorityThumbnails(centerIndex) {
     }
     
     for (const chunk of chunks) {
+        if (token !== undefined && token !== readerNavToken) break;
         if (!document.getElementById('screen-reader').classList.contains('active')) break;
         const promises = chunk.map(idx => {
             const nearPage = state.pages[idx];
             const nearCache = readerHighResThumbnails[nearPage.sourceFile];
             if (!nearCache || !nearCache[nearPage.originalNumber]) {
-                return loadSingleHighResThumbnail(nearPage);
+                return loadSingleHighResThumbnail(nearPage, token);
             }
             return Promise.resolve();
         });
@@ -1820,26 +2313,26 @@ async function loadSingleViewerThumbnail(page) {
     }
     
     try {
-        const result = await window.pedefo.pdf.generateSingleThumbnail(
-            page.sourceFile,
-            page.originalNumber,
-            dpi
-        );
+        const bounds = getViewerRenderBounds();
+        const url = await schedulePdfPageRender(page, {
+            variant: 'viewer',
+            maxWidth: dpi >= 100 ? bounds.maxWidth : Math.floor(bounds.maxWidth * 0.82),
+            maxHeight: dpi >= 100 ? bounds.maxHeight : Math.floor(bounds.maxHeight * 0.82),
+            priority: 100
+        });
         
-        if (result.success && result.data) {
-            // Initialize cache if needed
-            if (!viewerHighResThumbnails[page.sourceFile]) {
-                viewerHighResThumbnails[page.sourceFile] = {};
-            }
-            viewerHighResThumbnails[page.sourceFile][page.originalNumber] = result.data.data;
-            
-            // Update display if this is the current page
-            const currentPage = state.pages[viewerCurrentPage];
-            if (currentPage &&
-                currentPage.sourceFile === page.sourceFile &&
-                currentPage.originalNumber === page.originalNumber) {
-                showViewerPage(viewerCurrentPage);
-            }
+        // Initialize cache if needed
+        if (!viewerHighResThumbnails[page.sourceFile]) {
+            viewerHighResThumbnails[page.sourceFile] = {};
+        }
+        viewerHighResThumbnails[page.sourceFile][page.originalNumber] = url;
+        
+        // Update display if this is the current page
+        const currentPage = state.pages[viewerCurrentPage];
+        if (currentPage &&
+            currentPage.sourceFile === page.sourceFile &&
+            currentPage.originalNumber === page.originalNumber) {
+            showViewerPage(viewerCurrentPage);
         }
     } catch (error) {
         console.error(`Failed to load viewer thumbnail for page ${page.originalNumber}:`, error);
@@ -1915,11 +2408,33 @@ function renderViewerOutline() {
     }
 }
 
-function appendViewerOutlineItems(items, sourceFile, container, depth) {
-    items.forEach((item) => {
+function parseOutlinePageNumber(pageNumber) {
+    if (pageNumber === null || pageNumber === undefined) return null;
+    const parsed = parseInt(pageNumber, 10);
+    return Number.isNaN(parsed) ? null : parsed;
+}
+
+function findNextOutlineBoundaryPage(items, currentIndex, startPage, fallbackBoundaryPage) {
+    for (let i = currentIndex + 1; i < items.length; i++) {
+        const siblingPage = parseOutlinePageNumber(items[i]?.page);
+        if (siblingPage !== null && siblingPage > startPage) {
+            return siblingPage;
+        }
+    }
+    return fallbackBoundaryPage || null;
+}
+
+function appendViewerOutlineItems(items, sourceFile, container, depth, parentBoundaryPage = null) {
+    items.forEach((item, index) => {
         const el = document.createElement('div');
         el.className = 'viewer-outline-item';
         el.dataset.depth = depth;
+
+        const itemPage = parseOutlinePageNumber(item.page);
+        const boundaryPage = itemPage !== null
+            ? findNextOutlineBoundaryPage(items, index, itemPage, parentBoundaryPage)
+            : parentBoundaryPage;
+        const endPage = boundaryPage !== null ? boundaryPage - 1 : null;
 
         const label = document.createElement('span');
         label.className = 'viewer-outline-text';
@@ -1934,7 +2449,7 @@ function appendViewerOutlineItems(items, sourceFile, container, depth) {
         extractBtn.textContent = 'Ex';
         extractBtn.addEventListener('click', (e) => {
             e.stopPropagation();
-            extractOutlineChapter(sourceFile, item.page, item.title);
+            extractOutlineChapter(sourceFile, itemPage, endPage, item.title);
         });
         actions.appendChild(extractBtn);
 
@@ -1953,18 +2468,12 @@ function appendViewerOutlineItems(items, sourceFile, container, depth) {
         container.appendChild(el);
 
         if (item.children && item.children.length > 0) {
-            appendViewerOutlineItems(item.children, sourceFile, container, depth + 1);
+            appendViewerOutlineItems(item.children, sourceFile, container, depth + 1, boundaryPage);
         }
     });
 }
 
-async function extractOutlineChapter(sourceFile, startPage, title) {
-    const outline = viewerOutlineCache[sourceFile];
-    if (!outline || !Array.isArray(outline) || outline.length === 0) {
-        showToast('Kein Inhaltsverzeichnis verfügbar', 'error');
-        return;
-    }
-
+async function extractOutlineChapter(sourceFile, startPage, endPage, title) {
     const pagesForSource = state.pages.filter(p => p.sourceFile === sourceFile);
     if (pagesForSource.length === 0) {
         showToast('Quellseiten nicht gefunden', 'error');
@@ -1972,24 +2481,14 @@ async function extractOutlineChapter(sourceFile, startPage, title) {
     }
 
     const maxPage = Math.max(...pagesForSource.map(p => p.originalNumber));
-    const flat = flattenOutlineEntries(outline);
-    const sorted = flat.filter(e => e.page !== null).sort((a, b) => a.page - b.page);
-
-    const start = parseInt(startPage, 10);
-    if (Number.isNaN(start)) {
+    const start = parseOutlinePageNumber(startPage);
+    if (start === null) {
         showToast('Dieses Kapitel hat keine Seitenzahl', 'error');
         return;
     }
 
-    const idx = sorted.findIndex(e => e.page === start);
-    if (idx === -1) {
-        showToast('Kapitel konnte nicht gefunden werden', 'error');
-        return;
-    }
-
-    // Find next outline entry on a later page (ignore entries on the same page)
-    const nextLater = sorted.slice(idx + 1).find(e => e.page > start);
-    const end = nextLater ? nextLater.page - 1 : maxPage;
+    const parsedEnd = parseOutlinePageNumber(endPage);
+    const end = Math.min(parsedEnd !== null ? parsedEnd : maxPage, maxPage);
     const pagesToExtract = pagesForSource
         .filter(p => p.originalNumber >= start && p.originalNumber <= end)
         .map(p => ({ originalNumber: p.originalNumber, rotation: p.rotation }));
@@ -2017,17 +2516,6 @@ async function extractOutlineChapter(sourceFile, startPage, title) {
     } finally {
         hideLoading();
     }
-}
-
-function flattenOutlineEntries(entries, acc = []) {
-    entries.forEach((entry) => {
-        const pageNum = entry.page !== null && entry.page !== undefined ? parseInt(entry.page, 10) : null;
-        acc.push({ page: Number.isNaN(pageNum) ? null : pageNum, title: entry.title || '' });
-        if (entry.children && entry.children.length > 0) {
-            flattenOutlineEntries(entry.children, acc);
-        }
-    });
-    return acc;
 }
 
 function findViewerPageIndex(sourceFile, pageNumber) {

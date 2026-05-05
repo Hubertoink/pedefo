@@ -176,6 +176,20 @@ def get_page_count(input_file):
         response(False, f"Fehler: {str(e)}")
 
 
+def _is_contiguous_unrotated_pages(pages):
+    if not pages:
+        return False
+
+    expected = pages[0]['originalNumber']
+    for page_info in pages:
+        if page_info.get('rotation', 0) != 0:
+            return False
+        if page_info['originalNumber'] != expected:
+            return False
+        expected += 1
+    return True
+
+
 def build_pdf(operations_json, output):
     """
     Baut eine PDF aus mehreren Quellen mit Rotationen zusammen.
@@ -195,9 +209,18 @@ def build_pdf(operations_json, output):
                 response(False, f"Datei nicht gefunden: {source_file}")
                 return
             
+            pages = op.get('pages', [])
+
+            if _is_contiguous_unrotated_pages(pages):
+                start_idx = max(0, pages[0]['originalNumber'] - 1)
+                end_idx = pages[-1]['originalNumber']
+                writer.append(source_file, pages=(start_idx, end_idx), import_outline=False)
+                total_pages += end_idx - start_idx
+                continue
+
             reader = PdfReader(source_file)
             
-            for page_info in op['pages']:
+            for page_info in pages:
                 page_num = page_info['originalNumber'] - 1  # 0-basiert
                 rotation = page_info.get('rotation', 0)
                 

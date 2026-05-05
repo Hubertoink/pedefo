@@ -168,6 +168,86 @@ def check_poppler():
         response(False, "Poppler nicht gefunden")
 
 
+def generate_batch_thumbnails(pdf_path, page_numbers, dpi=72):
+    """Generiert Thumbnails für mehrere Seiten in einem Aufruf (effizienter)"""
+    if not os.path.exists(pdf_path):
+        response(False, f"Datei nicht gefunden: {pdf_path}")
+        return
+
+    if not page_numbers:
+        response(True, "0 Thumbnails generiert", {"thumbnails": []})
+        return
+    
+    poppler_path = get_poppler_path()
+    if not poppler_path:
+        response(False, "Poppler nicht gefunden")
+        return
+    
+    pdftoppm_exe = os.path.join(poppler_path, "pdftoppm.exe")
+    if not os.path.exists(pdftoppm_exe):
+        response(False, "pdftoppm.exe nicht gefunden")
+        return
+    
+    thumbnails = []
+    
+    with tempfile.TemporaryDirectory() as temp_dir:
+        # Sortiere Seitennummern für effizientere Verarbeitung
+        sorted_pages = sorted(set(page_numbers))
+        
+        # Finde zusammenhängende Bereiche für effizientere Batch-Aufrufe
+        ranges = []
+        start = sorted_pages[0]
+        end = start
+        for p in sorted_pages[1:]:
+            if p == end + 1:
+                end = p
+            else:
+                ranges.append((start, end))
+                start = p
+                end = p
+        ranges.append((start, end))
+        
+        try:
+            for (first, last) in ranges:
+                output_prefix = os.path.join(temp_dir, f"batch_{first}")
+                cmd = [
+                    pdftoppm_exe,
+                    "-png",
+                    "-r", str(dpi),
+                    "-f", str(first),
+                    "-l", str(last),
+                    pdf_path,
+                    output_prefix
+                ]
+                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+                if proc.returncode != 0:
+                    response(False, f"pdftoppm Fehler: {proc.stderr}")
+                    return
+            
+            # Alle generierten PNGs sammeln
+            for png_file in Path(temp_dir).glob("batch_*-*.png"):
+                # Dateiname: batch_X-Y.png wobei Y die Seitennummer ist
+                name = png_file.stem
+                parts = name.split("-")
+                if len(parts) >= 2:
+                    page_num = int(parts[-1])
+                    if page_num in page_numbers:
+                        with open(png_file, "rb") as f:
+                            b64 = base64.b64encode(f.read()).decode("utf-8")
+                            thumbnails.append({
+                                "page": page_num,
+                                "data": f"data:image/png;base64,{b64}"
+                            })
+            
+            response(True, f"{len(thumbnails)} Thumbnails generiert", {
+                "thumbnails": thumbnails
+            })
+        except subprocess.TimeoutExpired:
+            response(False, "Timeout bei Batch-Generierung")
+        except Exception as e:
+            response(False, f"Fehler: {str(e)}")
+
+
 def generate_single_thumbnail(pdf_path, page_number, dpi=72):
     """Generiert ein Thumbnail für eine einzelne Seite"""
     if not os.path.exists(pdf_path):
@@ -255,6 +335,15 @@ if __name__ == "__main__":
                 page_number = int(sys.argv[3])
                 dpi = int(sys.argv[4]) if len(sys.argv) > 4 else 72
                 generate_single_thumbnail(pdf_path, page_number, dpi)
+        
+        elif cmd == "generate_batch":
+            if len(sys.argv) < 4:
+                response(False, "Benötigt: generate_batch <pdf_path> <page_numbers_json> [dpi]")
+            else:
+                pdf_path = sys.argv[2]
+                page_numbers = json.loads(sys.argv[3])
+                dpi = int(sys.argv[4]) if len(sys.argv) > 4 else 72
+                generate_batch_thumbnails(pdf_path, page_numbers, dpi)
         
         elif cmd == "check":
             check_poppler()

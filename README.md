@@ -86,7 +86,11 @@ Output landet unter `dist/`.
 ## 🔧 Troubleshooting
 
 - **Python nicht gefunden**: Stelle sicher, dass `python` im PATH liegt (`python --version`).
-- **Ghostscript nicht installiert**: Kompression funktioniert trotzdem, aber weniger effektiv. Installiere GS für bessere Ergebnisse.
+- **Ghostscript nicht installiert**: Kompression funktioniert trotzdem, aber oft kaum wirksam. So gehst du vor:
+	- Ghostscript herunterladen: https://ghostscript.com/releases/gsdnld.html
+	- Installer ausführen (Standardpfad ist ok)
+	- Pedefo komplett schließen und neu starten
+	- Danach erneut komprimieren
 - **Outline leer**: PDF hat kein TOC oder Poppler/`utils.py` liefert keins; App zeigt Placeholder.
 
 ## 📜 Lizenz
