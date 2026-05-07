@@ -11,6 +11,7 @@ Pedefo ist eine lokale Electron-App zum schnellen Bearbeiten, Lesen und Extrahie
 - 📂 **PDF laden per Drag & Drop** (lokal, offline)
 - 🖼 **Raster-Ansicht**: Seiten duplizieren, löschen, drehen, neu anordnen, andere PDFs einfügen, Split-Marker setzen
 - 📑 **Leseansicht mit Outline**: Kapitel anzeigen, aktive Kapitel automatisch hervorheben, Seitenbereiche pro Kapitel sehen
+- 🔖 **Eigene Kapitel setzen**: Seiten als Kapitelstart markieren und beim Speichern als PDF-Inhaltsverzeichnis/Bookmarks ausgeben
 - 📤 **Kapitel/Seiten exportieren**: Kapitel-Export über Outline-Icon (verwendet berechnete Seitenbereiche), Auswahl-Export, Bereichs-Export
 - 🗜 **Komprimieren**: Ghostscript (optional) für bessere Reduktion, PyPDF2 als Fallback
 - 🖼 **Thumbnails**: Poppler-generiert, lazy loading; High-Res für Reader/Vollbild
@@ -45,6 +46,7 @@ pip install -r python-scripts/requirements.txt
 - **PDF öffnen**: Datei in die Startfläche ziehen oder auswählen.
 - **Raster-Ansicht**: Seiten anklicken/Shift-Range, Aktionen über Karten-Buttons oder Toolbar (Duplizieren, Löschen, Drehen). Split-Punkte über „Trennen“-Icon zwischen Seiten.
 - **Leseansicht**: Outline rechts zeigt Kapitel inkl. Seitenbereich (z. B. `S. 29-133`), aktives Kapitel wird hervorgehoben. Klick springt zur Seite. Export-Icon exportiert den gesamten Kapitelbereich; Erfolgstoast bietet „Öffnen“ an.
+- **Eigene Kapitel**: Seite auswählen → „Kapitel“ in der Toolbar → Titel vergeben. Beim Speichern werden diese Kapitel als PDF-Bookmarks geschrieben.
 - **Auswahl-Export**: Seiten markieren → „Extrahieren“. Bereichs-Export über Dialog.
 - **Komprimieren**: Toolbar → Qualität wählen → exportieren.
 - **Vollbild-Viewer**: Klick auf Vollbild-Button; Navigation mit ← → (oder ↑/↓/Space). Outline mit Export-Icons verfügbar.

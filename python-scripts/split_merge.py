@@ -190,14 +190,52 @@ def _is_contiguous_unrotated_pages(pages):
     return True
 
 
+def _normalize_chapters(chapters, total_pages):
+    normalized = []
+    if not isinstance(chapters, list):
+        return normalized
+
+    for chapter in chapters:
+        if not isinstance(chapter, dict):
+            continue
+        title = str(chapter.get('title', '')).strip()
+        if not title:
+            continue
+        try:
+            page_number = int(chapter.get('page', 0))
+        except Exception:
+            continue
+        if 1 <= page_number <= total_pages:
+            normalized.append({
+                'title': title[:200],
+                'page': page_number
+            })
+
+    return normalized
+
+
+def _add_outline_item(writer, title, page_index):
+    if hasattr(writer, 'add_outline_item'):
+        writer.add_outline_item(title, page_index)
+    elif hasattr(writer, 'addBookmark'):
+        writer.addBookmark(title, page_index)
+
+
 def build_pdf(operations_json, output):
     """
     Baut eine PDF aus mehreren Quellen mit Rotationen zusammen.
     operations_json: JSON-Array von Objekten mit {sourceFile, pages: [{originalNumber, rotation}]}
+    oder Objekt {operations, chapters}, wobei chapters PDF-Outlines erzeugt.
     """
     try:
         import json as json_module
-        operations = json_module.loads(operations_json)
+        payload = json_module.loads(operations_json)
+        if isinstance(payload, dict):
+            operations = payload.get('operations', [])
+            chapters = payload.get('chapters', [])
+        else:
+            operations = payload
+            chapters = []
         
         writer = PdfWriter()
         total_pages = 0
@@ -236,13 +274,18 @@ def build_pdf(operations_json, output):
         if total_pages == 0:
             response(False, "Keine Seiten zum Speichern")
             return
+
+        normalized_chapters = _normalize_chapters(chapters, total_pages)
+        for chapter in normalized_chapters:
+            _add_outline_item(writer, chapter['title'], chapter['page'] - 1)
         
         with open(output, "wb") as f:
             writer.write(f)
         
         response(True, "PDF erfolgreich erstellt", {
             "output": output,
-            "pages": total_pages
+            "pages": total_pages,
+            "chapters": len(normalized_chapters)
         })
     except Exception as e:
         response(False, f"Fehler beim Erstellen: {str(e)}")

@@ -11,7 +11,8 @@ const state = {
     isDirty: false,
     thumbnailsGenerating: false,  // Lock to prevent parallel thumbnail generation
     splitPoints: [],             // page indices where a split starts (between pages)
-    lastFocusedPageId: null      // used to prioritize loading around user focus
+    lastFocusedPageId: null,     // used to prioritize loading around user focus
+    editingChapterPageId: null
 };
 
 // Performance helpers
@@ -273,6 +274,20 @@ function getBaseName(filePath) {
     return filePath.split(/[\\/]/).pop();
 }
 
+function escapeHtml(value) {
+    return String(value || '').replace(/[&<>"']/g, (char) => ({
+        '&': '&amp;',
+        '<': '&lt;',
+        '>': '&gt;',
+        '"': '&quot;',
+        "'": '&#39;'
+    }[char]));
+}
+
+function getChapterTitle(page) {
+    return (page && typeof page.chapterTitle === 'string') ? page.chapterTitle.trim() : '';
+}
+
 // ============================================
 // Screen Management
 // ============================================
@@ -382,7 +397,8 @@ async function loadPDF(filePath) {
                 originalNumber: i,
                 sourceFile: filePath,
                 rotation: 0,
-                thumbnail: null
+                thumbnail: null,
+                chapterTitle: ''
             });
         }
 
@@ -734,6 +750,10 @@ function createPageCard(page, index) {
     const thumbnailContent = page.thumbnail 
         ? `<img src="${page.thumbnail}" alt="Seite ${index + 1}" style="transform: rotate(${page.rotation}deg)">`
         : index + 1;
+    const chapterTitle = getChapterTitle(page);
+    const chapterBadge = chapterTitle
+        ? `<div class="page-chapter-badge" title="Kapitel: ${escapeHtml(chapterTitle)}"><span>${escapeHtml(chapterTitle)}</span></div>`
+        : '';
     
     card.innerHTML = `
         <div class="page-thumbnail-wrapper">
@@ -742,8 +762,14 @@ function createPageCard(page, index) {
                     <polyline points="20 6 9 17 4 12"/>
                 </svg>
             </div>
+            ${chapterBadge}
             <div class="page-thumbnail">${thumbnailContent}</div>
             <div class="page-actions">
+                <button class="page-action-btn" data-action="chapter" title="Kapitel setzen">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
+                    </svg>
+                </button>
                 <button class="page-action-btn" data-action="rotate-left" title="Links drehen">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M2.5 2v6h6"/>
@@ -942,6 +968,25 @@ function pagesToOperations(pages) {
     return ops;
 }
 
+function chaptersForPages(pages) {
+    return pages
+        .map((page, index) => ({
+            title: getChapterTitle(page),
+            page: index + 1
+        }))
+        .filter(chapter => chapter.title);
+}
+
+function buildPdfPayloadForPages(pages) {
+    const operations = pagesToOperations(pages);
+    const chapters = chaptersForPages(pages);
+    return chapters.length > 0 ? { operations, chapters } : operations;
+}
+
+async function buildPdfForPages(pages, outputPath) {
+    return window.pedefo.pdf.buildPDF(buildPdfPayloadForPages(pages), outputPath);
+}
+
 function getFileBaseName(path) {
     if (!path) return 'dokument';
     const base = getBaseName(path);
@@ -1036,14 +1081,13 @@ async function exportSplitPart(part, number, baseName) {
         return;
     }
 
-    const ops = pagesToOperations(pages);
     const defaultName = `${baseName}_Teil${number}.pdf`;
     const output = await window.pedefo.saveFile(defaultName);
     if (!output) return;
 
     showLoading('Teil wird exportiert...');
     try {
-        const res = await window.pedefo.pdf.buildPDF(ops, output);
+        const res = await buildPdfForPages(pages, output);
         if (res.success) {
             showToast('Teil exportiert', 'success');
         } else {
@@ -1065,6 +1109,11 @@ function updateStatusBar() {
 // ============================================
 
 function handlePageAction(action, pageId) {
+    if (action === 'chapter') {
+        openChapterModalForPage(pageId);
+        return;
+    }
+
     const pageIds = state.selectedPages.has(pageId) 
         ? Array.from(state.selectedPages) 
         : [pageId];
@@ -1083,6 +1132,148 @@ function handlePageAction(action, pageId) {
             deletePages(pageIds);
             break;
     }
+}
+
+function getChapterTargetPageId() {
+    if (state.selectedPages.size > 0) {
+        const selectedPage = state.pages.find(page => state.selectedPages.has(page.id));
+        return selectedPage?.id || null;
+    }
+
+    const readerScreen = document.getElementById('screen-reader');
+    if (readerScreen?.classList.contains('active') && state.pages[readerCurrentPage]) {
+        return state.pages[readerCurrentPage].id;
+    }
+
+    if (state.lastFocusedPageId && pageIndexById.has(state.lastFocusedPageId)) {
+        return state.lastFocusedPageId;
+    }
+
+    return state.pages[0]?.id || null;
+}
+
+function openChapterModalForCurrentPage() {
+    const pageId = getChapterTargetPageId();
+    if (!pageId) {
+        showToast('Keine Seite für ein Kapitel verfügbar', 'error');
+        return;
+    }
+    openChapterModalForPage(pageId);
+}
+
+function openChapterModalForPage(pageId) {
+    const pageIndex = state.pages.findIndex(p => p.id === pageId);
+    if (pageIndex === -1) {
+        showToast('Seite nicht gefunden', 'error');
+        return;
+    }
+
+    const page = state.pages[pageIndex];
+    state.editingChapterPageId = pageId;
+    populateChapterPageSelect(pageId);
+    document.getElementById('chapter-page-label').textContent = `Kapitel startet auf Seite ${pageIndex + 1}.`;
+    const input = document.getElementById('chapter-title');
+    input.value = getChapterTitle(page);
+    input.dataset.loadedTitle = input.value;
+    input.dataset.loadedPageId = page.id;
+    updateChapterRemoveButton();
+    showModal('chapter');
+    setTimeout(() => {
+        input.focus();
+        input.select();
+    }, 0);
+}
+
+function populateChapterPageSelect(selectedPageId) {
+    const select = document.getElementById('chapter-page-select');
+    if (!select) return;
+
+    select.innerHTML = '';
+    state.pages.forEach((page, index) => {
+        const option = document.createElement('option');
+        option.value = page.id;
+        const chapterTitle = getChapterTitle(page);
+        option.textContent = chapterTitle
+            ? `Seite ${index + 1} · ${chapterTitle}`
+            : `Seite ${index + 1}`;
+        select.appendChild(option);
+    });
+    select.value = selectedPageId;
+}
+
+function getSelectedChapterPage() {
+    const select = document.getElementById('chapter-page-select');
+    const pageId = select?.value || state.editingChapterPageId;
+    return state.pages.find(page => page.id === pageId) || null;
+}
+
+function updateChapterRemoveButton() {
+    const page = getSelectedChapterPage();
+    const removeBtn = document.getElementById('btn-chapter-remove');
+    if (removeBtn) {
+        removeBtn.style.visibility = getChapterTitle(page) ? 'visible' : 'hidden';
+    }
+}
+
+function handleChapterPageSelectChange() {
+    const page = getSelectedChapterPage();
+    if (!page) return;
+
+    const pageIndex = state.pages.findIndex(p => p.id === page.id);
+    state.editingChapterPageId = page.id;
+    document.getElementById('chapter-page-label').textContent = `Kapitel startet auf Seite ${pageIndex + 1}.`;
+
+    const input = document.getElementById('chapter-title');
+    if (input) {
+        const loadedTitle = input.dataset.loadedTitle || '';
+        const shouldReplaceTitle = !input.value.trim() || input.value.trim() === loadedTitle;
+        const nextTitle = getChapterTitle(page);
+        if (shouldReplaceTitle) {
+            input.value = nextTitle;
+        }
+        input.dataset.loadedTitle = nextTitle;
+        input.dataset.loadedPageId = page.id;
+    }
+    updateChapterRemoveButton();
+}
+
+function refreshChapterViews() {
+    renderPages();
+    renderOutlinePanel();
+    renderViewerOutline();
+    updateViewerActions();
+    if (document.getElementById('screen-reader')?.classList.contains('active')) {
+        renderReaderThumbnails();
+    }
+}
+
+function saveChapterFromModal() {
+    const page = getSelectedChapterPage();
+    if (!page) {
+        hideModal();
+        return;
+    }
+
+    const title = document.getElementById('chapter-title').value.trim();
+    page.chapterTitle = title;
+    state.isDirty = true;
+    hideModal();
+    refreshChapterViews();
+    showToast(title ? 'Kapitel gesetzt' : 'Kapitel entfernt', 'success');
+}
+
+function removeChapterFromModal() {
+    const page = getSelectedChapterPage();
+    if (!page) {
+        hideModal();
+        return;
+    }
+
+    page.chapterTitle = '';
+    state.isDirty = true;
+    hideModal();
+    refreshChapterViews();
+    showToast('Kapitel entfernt', 'success');
 }
 
 function rotatePagesBy(pageIds, degrees) {
@@ -1112,7 +1303,8 @@ function duplicatePages(pageIds) {
         if (page) {
             const newPage = {
                 ...page,
-                id: `page-dup-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`
+                id: `page-dup-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`,
+                chapterTitle: ''
             };
             newPages.push({ index: pageIndex + 1, page: newPage });
         }
@@ -1253,7 +1445,8 @@ async function insertPDFAt(insertIndex) {
                 originalNumber: i,
                 sourceFile: filePath,
                 rotation: 0,
-                thumbnail: null
+                thumbnail: null,
+                chapterTitle: ''
             });
         }
         
@@ -1312,26 +1505,7 @@ async function savePDF() {
     showLoading('Speichere PDF...');
     
     try {
-        // Group pages by source file
-        const operations = [];
-        let currentGroup = null;
-        
-        state.pages.forEach((page, index) => {
-            if (!currentGroup || currentGroup.sourceFile !== page.sourceFile) {
-                currentGroup = {
-                    sourceFile: page.sourceFile,
-                    pages: []
-                };
-                operations.push(currentGroup);
-            }
-            currentGroup.pages.push({
-                originalNumber: page.originalNumber,
-                rotation: page.rotation
-            });
-        });
-        
-        // Build the PDF using Python
-        const result = await window.pedefo.pdf.buildPDF(operations, outputPath);
+        const result = await buildPdfForPages(state.pages, outputPath);
         
         if (result.success) {
             state.isDirty = false;
@@ -1382,27 +1556,8 @@ async function extractPages() {
     showLoading('Extrahiere Seiten...');
     
     try {
-        // Get the pages to extract with their source files
         const pagesToExtract = state.pages.slice(start - 1, end);
-        
-        const operations = [];
-        let currentGroup = null;
-        
-        pagesToExtract.forEach(page => {
-            if (!currentGroup || currentGroup.sourceFile !== page.sourceFile) {
-                currentGroup = {
-                    sourceFile: page.sourceFile,
-                    pages: []
-                };
-                operations.push(currentGroup);
-            }
-            currentGroup.pages.push({
-                originalNumber: page.originalNumber,
-                rotation: page.rotation
-            });
-        });
-        
-        const result = await window.pedefo.pdf.buildPDF(operations, outputPath);
+        const result = await buildPdfForPages(pagesToExtract, outputPath);
         
         if (result.success) {
             showToast(`${end - start + 1} Seiten extrahiert`, 'success');
@@ -1485,27 +1640,11 @@ async function compressPDF() {
         const tempPath = /\.pdf$/i.test(outputPath)
             ? outputPath.replace(/\.pdf$/i, '_temp.pdf')
             : `${outputPath}_temp.pdf`;
-        
-        // Build current document
-        const operations = [];
-        let currentGroup = null;
-        
-        state.pages.forEach(page => {
-            if (!currentGroup || currentGroup.sourceFile !== page.sourceFile) {
-                currentGroup = {
-                    sourceFile: page.sourceFile,
-                    pages: []
-                };
-                operations.push(currentGroup);
-            }
-            currentGroup.pages.push({
-                originalNumber: page.originalNumber,
-                rotation: page.rotation
-            });
-        });
+        const hasCustomChapters = chaptersForPages(state.pages).length > 0;
         
         // If only one source file and no modifications, compress directly
         const sourceFile = state.pages.length > 0 && 
+            !hasCustomChapters &&
             state.pages.every(p => p.sourceFile === state.pages[0].sourceFile && p.rotation === 0)
             ? state.pages[0].sourceFile
             : null;
@@ -1516,7 +1655,7 @@ async function compressPDF() {
         } else {
             // Build temp file first, then compress
             setLoadingProgress(8, 'Aktuelles PDF wird vorbereitet...');
-            await window.pedefo.pdf.buildPDF(operations, tempPath);
+            await buildPdfForPages(state.pages, tempPath);
             setLoadingProgress(12, 'Kompression startet...');
             result = await window.pedefo.pdf.compress(tempPath, outputPath, quality, operationId);
         }
@@ -1673,6 +1812,16 @@ function renderReaderThumbnails() {
         num.className = 'reader-thumb-number';
         num.textContent = index + 1;
         thumb.appendChild(num);
+
+        const chapterTitle = getChapterTitle(page);
+        if (chapterTitle) {
+            thumb.classList.add('has-chapter');
+            thumb.title = `Kapitel: ${chapterTitle}`;
+            const chapterMarker = document.createElement('span');
+            chapterMarker.className = 'reader-thumb-chapter';
+            chapterMarker.textContent = 'Kapitel';
+            thumb.appendChild(chapterMarker);
+        }
         
         thumb.addEventListener('click', () => {
             showReaderPage(index);
@@ -1925,6 +2074,16 @@ async function loadOutlineForSources(forceRefresh = false) {
     renderOutlinePanel();
 }
 
+function getCustomChapterEntries() {
+    return state.pages
+        .map((page, index) => ({
+            title: getChapterTitle(page),
+            page: index + 1,
+            targetIndex: index
+        }))
+        .filter(entry => entry.title);
+}
+
 function renderOutlinePanel() {
     const body = document.getElementById('reader-outline-body');
     if (!body) return;
@@ -1937,6 +2096,16 @@ function renderOutlinePanel() {
     const files = Array.from(new Set(state.pages.map(p => p.sourceFile)));
     const multipleSources = files.length > 1;
     let hasEntries = false;
+
+    const customChapters = getCustomChapterEntries();
+    if (customChapters.length > 0) {
+        hasEntries = true;
+        const sourceLabel = document.createElement('div');
+        sourceLabel.className = 'reader-outline-source';
+        sourceLabel.textContent = 'Eigene Kapitel';
+        body.appendChild(sourceLabel);
+        appendCustomOutlineItems(customChapters, body);
+    }
 
     files.forEach((filePath) => {
         const outline = outlineCache[filePath];
@@ -1958,6 +2127,27 @@ function renderOutlinePanel() {
     } else {
         highlightOutlineForPage(readerCurrentPage);
     }
+}
+
+function appendCustomOutlineItems(entries, container) {
+    entries.forEach((entry) => {
+        const item = document.createElement('div');
+        item.className = 'outline-item outline-item-custom';
+        item.dataset.targetIndex = entry.targetIndex;
+
+        const titleSpan = document.createElement('span');
+        titleSpan.className = 'outline-title';
+        titleSpan.textContent = entry.title;
+
+        const pageSpan = document.createElement('span');
+        pageSpan.className = 'outline-page';
+        pageSpan.textContent = `S. ${entry.page}`;
+
+        item.addEventListener('click', () => showReaderPage(entry.targetIndex));
+        item.appendChild(titleSpan);
+        item.appendChild(pageSpan);
+        container.appendChild(item);
+    });
 }
 
 function appendOutlineItems(entries, sourceFile, container, depth) {
@@ -2300,6 +2490,7 @@ function showViewerPage(index) {
     // Update navigation buttons
     document.getElementById('btn-viewer-prev').disabled = index === 0;
     document.getElementById('btn-viewer-next').disabled = index === state.pages.length - 1;
+    updateViewerActions();
     
     // Update outline highlighting
     highlightViewerOutline(index);
@@ -2393,6 +2584,80 @@ async function loadSingleViewerThumbnail(page) {
     }
 }
 
+function getCurrentViewerPage() {
+    return state.pages[viewerCurrentPage] || null;
+}
+
+function updateViewerActions() {
+    const page = getCurrentViewerPage();
+    const chapterBtn = document.getElementById('btn-viewer-chapter');
+    const deleteBtn = document.getElementById('btn-viewer-delete');
+
+    if (chapterBtn) {
+        chapterBtn.classList.toggle('active', !!getChapterTitle(page));
+    }
+
+    if (deleteBtn) {
+        deleteBtn.disabled = state.pages.length <= 1;
+    }
+}
+
+function openViewerChapterModal() {
+    const page = getCurrentViewerPage();
+    if (!page) return;
+    openChapterModalForPage(page.id);
+}
+
+function rotateViewerPage(degrees) {
+    const page = getCurrentViewerPage();
+    if (!page) return;
+    rotatePagesBy([page.id], degrees);
+    showViewerPage(viewerCurrentPage);
+}
+
+async function extractViewerPage() {
+    const page = getCurrentViewerPage();
+    if (!page) return;
+
+    const outputPath = await window.pedefo.saveFile(`seite_${viewerCurrentPage + 1}.pdf`);
+    if (!outputPath) return;
+
+    showLoading('Seite wird extrahiert...');
+    try {
+        const result = await buildPdfForPages([page], outputPath);
+        if (result.success) {
+            showToast('Seite extrahiert', 'success');
+        } else {
+            throw new Error(result.message || 'Fehler beim Extrahieren');
+        }
+    } catch (error) {
+        showToast(error.message, 'error');
+    } finally {
+        hideLoading();
+    }
+}
+
+function duplicateViewerPage() {
+    const page = getCurrentViewerPage();
+    if (!page) return;
+    duplicatePages([page.id]);
+    showViewerPage(Math.min(viewerCurrentPage + 1, state.pages.length - 1));
+    renderViewerOutline();
+}
+
+function deleteViewerPage() {
+    const page = getCurrentViewerPage();
+    if (!page || state.pages.length <= 1) return;
+    const nextIndex = Math.min(viewerCurrentPage, state.pages.length - 2);
+    deletePages([page.id]);
+    if (state.pages.length === 0) {
+        closePageViewer();
+        return;
+    }
+    showViewerPage(nextIndex);
+    renderViewerOutline();
+}
+
 function showViewerLoading(show) {
     const loading = document.getElementById('viewer-loading');
     const img = document.getElementById('viewer-page-image');
@@ -2441,6 +2706,16 @@ function renderViewerOutline() {
     const files = Array.from(new Set(state.pages.map(p => p.sourceFile)));
     const multipleSources = files.length > 1;
     let hasEntries = false;
+
+    const customChapters = getCustomChapterEntries();
+    if (customChapters.length > 0) {
+        hasEntries = true;
+        const sourceLabel = document.createElement('div');
+        sourceLabel.className = 'viewer-outline-source';
+        sourceLabel.textContent = 'Eigene Kapitel';
+        body.appendChild(sourceLabel);
+        appendViewerCustomOutlineItems(customChapters, body);
+    }
     
     files.forEach((filePath) => {
         const outline = viewerOutlineCache[filePath];
@@ -2459,6 +2734,64 @@ function renderViewerOutline() {
     
     if (!hasEntries) {
         body.appendChild(placeholder);
+    }
+}
+
+function appendViewerCustomOutlineItems(entries, container) {
+    entries.forEach((entry, index) => {
+        const el = document.createElement('div');
+        el.className = 'viewer-outline-item viewer-outline-item-custom';
+        el.dataset.depth = 0;
+        el.dataset.targetIndex = entry.targetIndex;
+
+        const label = document.createElement('span');
+        label.className = 'viewer-outline-text';
+        label.textContent = entry.title;
+
+        const actions = document.createElement('div');
+        actions.className = 'viewer-outline-actions';
+
+        const extractBtn = document.createElement('button');
+        extractBtn.className = 'viewer-outline-action';
+        extractBtn.title = 'Kapitel extrahieren';
+        extractBtn.textContent = 'Ex';
+        extractBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            extractCustomChapter(entry, entries[index + 1]);
+        });
+        actions.appendChild(extractBtn);
+
+        el.appendChild(label);
+        el.appendChild(actions);
+        el.addEventListener('click', () => showViewerPage(entry.targetIndex));
+        container.appendChild(el);
+    });
+}
+
+async function extractCustomChapter(entry, nextEntry) {
+    const startIndex = entry.targetIndex;
+    const endIndex = nextEntry ? nextEntry.targetIndex - 1 : state.pages.length - 1;
+    const pagesToExtract = state.pages.slice(startIndex, endIndex + 1);
+    if (pagesToExtract.length === 0) {
+        showToast('Keine Seiten im Kapitel gefunden', 'error');
+        return;
+    }
+
+    const outputPath = await window.pedefo.saveFile(`${sanitizeFilename(entry.title || 'Kapitel')}.pdf`);
+    if (!outputPath) return;
+
+    showLoading('Kapitel wird extrahiert...');
+    try {
+        const result = await buildPdfForPages(pagesToExtract, outputPath);
+        if (result.success) {
+            showToast('Kapitel extrahiert', 'success');
+        } else {
+            throw new Error(result.message || 'Fehler beim Extrahieren');
+        }
+    } catch (error) {
+        showToast(error.message, 'error');
+    } finally {
+        hideLoading();
     }
 }
 
@@ -2544,8 +2877,7 @@ async function extractOutlineChapter(sourceFile, startPage, endPage, title) {
     const parsedEnd = parseOutlinePageNumber(endPage);
     const end = Math.min(parsedEnd !== null ? parsedEnd : maxPage, maxPage);
     const pagesToExtract = pagesForSource
-        .filter(p => p.originalNumber >= start && p.originalNumber <= end)
-        .map(p => ({ originalNumber: p.originalNumber, rotation: p.rotation }));
+        .filter(p => p.originalNumber >= start && p.originalNumber <= end);
 
     if (pagesToExtract.length === 0) {
         showToast('Keine Seiten im Kapitel gefunden', 'error');
@@ -2558,8 +2890,7 @@ async function extractOutlineChapter(sourceFile, startPage, endPage, title) {
 
     showLoading('Kapitel wird extrahiert...');
     try {
-        const operations = [{ sourceFile, pages: pagesToExtract }];
-        const result = await window.pedefo.pdf.buildPDF(operations, outputPath);
+        const result = await buildPdfForPages(pagesToExtract, outputPath);
         if (result.success) {
             showToast('Kapitel extrahiert', 'success');
         } else {
@@ -2604,6 +2935,12 @@ document.getElementById('btn-viewer-next').addEventListener('click', () => {
 document.getElementById('btn-viewer-outline-refresh').addEventListener('click', () => {
     loadViewerOutline(true);
 });
+document.getElementById('btn-viewer-chapter').addEventListener('click', openViewerChapterModal);
+document.getElementById('btn-viewer-rotate-left').addEventListener('click', () => rotateViewerPage(-90));
+document.getElementById('btn-viewer-rotate-right').addEventListener('click', () => rotateViewerPage(90));
+document.getElementById('btn-viewer-extract').addEventListener('click', extractViewerPage);
+document.getElementById('btn-viewer-duplicate').addEventListener('click', duplicateViewerPage);
+document.getElementById('btn-viewer-delete').addEventListener('click', deleteViewerPage);
 
 // Keyboard Navigation
 document.addEventListener('keydown', (e) => {
@@ -2636,34 +2973,13 @@ async function extractSelectedPages() {
     showLoading('Extrahiere Seiten...');
     
     try {
-        // Sammle die ausgewählten Seiten in der richtigen Reihenfolge
-        const selectedIndices = [];
-        state.pages.forEach((page, index) => {
+        const selectedPages = [];
+        state.pages.forEach((page) => {
             if (state.selectedPages.has(page.id)) {
-                selectedIndices.push(index);
+                selectedPages.push(page);
             }
         });
-        
-        // Gruppiere nach Quelldatei
-        const operations = [];
-        let currentGroup = null;
-        
-        selectedIndices.forEach(index => {
-            const page = state.pages[index];
-            if (!currentGroup || currentGroup.sourceFile !== page.sourceFile) {
-                currentGroup = {
-                    sourceFile: page.sourceFile,
-                    pages: []
-                };
-                operations.push(currentGroup);
-            }
-            currentGroup.pages.push({
-                originalNumber: page.originalNumber,
-                rotation: page.rotation
-            });
-        });
-        
-        const result = await window.pedefo.pdf.buildPDF(operations, outputPath);
+        const result = await buildPdfForPages(selectedPages, outputPath);
         
         if (result.success) {
             showToast(`${state.selectedPages.size} Seite(n) extrahiert`, 'success');
@@ -2695,6 +3011,7 @@ document.getElementById('btn-rotate-right').addEventListener('click', () => {
 });
 
 document.getElementById('btn-extract-selection').addEventListener('click', extractSelectedPages);
+document.getElementById('btn-chapter-selection').addEventListener('click', openChapterModalForCurrentPage);
 
 document.getElementById('btn-duplicate').addEventListener('click', () => {
     if (state.selectedPages.size > 0) {
@@ -2730,6 +3047,17 @@ document.getElementById('btn-add-pdf').addEventListener('click', () => {
 
 document.getElementById('btn-extract').addEventListener('click', openExtractModal);
 document.getElementById('btn-extract-confirm').addEventListener('click', extractPages);
+
+document.getElementById('btn-chapter').addEventListener('click', openChapterModalForCurrentPage);
+document.getElementById('btn-chapter-save').addEventListener('click', saveChapterFromModal);
+document.getElementById('btn-chapter-remove').addEventListener('click', removeChapterFromModal);
+document.getElementById('chapter-page-select').addEventListener('change', handleChapterPageSelectChange);
+document.getElementById('chapter-title').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') {
+        e.preventDefault();
+        saveChapterFromModal();
+    }
+});
 
 document.getElementById('btn-compress').addEventListener('click', openCompressModal);
 document.getElementById('btn-compress-confirm').addEventListener('click', compressPDF);
