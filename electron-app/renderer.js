@@ -44,6 +44,11 @@ const pdfRender = {
     loadToken: 0
 };
 
+const textLayerTokens = {
+    reader: 0,
+    viewer: 0
+};
+
 // Grid thumbnail visibility tracking (avoids scanning all cards on scroll)
 let gridThumbObserver = null;
 let gridVisiblePageIds = new Set();
@@ -105,6 +110,139 @@ async function getPdfPageCount(filePath) {
         const result = await window.pedefo.pdf.getPageCount(filePath);
         if (!result.success) throw new Error(result.message);
         return result.data.pages;
+    }
+}
+
+function getTextLayerImageId(target) {
+    return target === 'viewer' ? 'viewer-page-image' : 'reader-page-image';
+}
+
+function getTextLayerId(target) {
+    return target === 'viewer' ? 'viewer-text-layer' : 'reader-text-layer';
+}
+
+function clearSelectableTextLayer(target) {
+    textLayerTokens[target] = (textLayerTokens[target] || 0) + 1;
+    const layer = document.getElementById(getTextLayerId(target));
+    if (layer) {
+        layer.innerHTML = '';
+        layer.classList.remove('has-text');
+        layer.style.display = 'none';
+    }
+}
+
+function ensureSelectableTextLayer(target) {
+    const img = document.getElementById(getTextLayerImageId(target));
+    if (!img) return null;
+
+    const host = img.closest('.reader-image-container, .page-viewer-content') || img.parentElement;
+    if (!host) return null;
+
+    let layer = document.getElementById(getTextLayerId(target));
+    if (!layer) {
+        layer = document.createElement('div');
+        layer.id = getTextLayerId(target);
+        layer.className = 'pdf-text-layer textLayer';
+        host.appendChild(layer);
+    }
+
+    return { img, host, layer };
+}
+
+function waitForImageLayout(img) {
+    if (img.complete && img.naturalWidth > 0 && img.getBoundingClientRect().width > 0) {
+        return Promise.resolve();
+    }
+
+    return new Promise((resolve) => {
+        let done = false;
+        const finish = () => {
+            if (done) return;
+            done = true;
+            img.removeEventListener('load', finish);
+            img.removeEventListener('error', finish);
+            resolve();
+        };
+        img.addEventListener('load', finish, { once: true });
+        img.addEventListener('error', finish, { once: true });
+        setTimeout(finish, 2500);
+    });
+}
+
+function positionSelectableTextLayer(layer, host, img) {
+    const hostRect = host.getBoundingClientRect();
+    const imgRect = img.getBoundingClientRect();
+
+    if (!hostRect.width || !hostRect.height || !imgRect.width || !imgRect.height) {
+        return null;
+    }
+
+    layer.style.display = 'block';
+    layer.style.left = `${imgRect.left - hostRect.left}px`;
+    layer.style.top = `${imgRect.top - hostRect.top}px`;
+    layer.style.width = `${imgRect.width}px`;
+    layer.style.height = `${imgRect.height}px`;
+    return { width: imgRect.width, height: imgRect.height };
+}
+
+async function renderSelectableTextLayer(target, page) {
+    const token = (textLayerTokens[target] || 0) + 1;
+    textLayerTokens[target] = token;
+
+    const elements = ensureSelectableTextLayer(target);
+    if (!elements || !page) return;
+
+    const { img, host, layer } = elements;
+    layer.innerHTML = '';
+    layer.classList.remove('has-text');
+    layer.style.display = 'none';
+
+    if (!img.src) return;
+
+    try {
+        await waitForImageLayout(img);
+        if (textLayerTokens[target] !== token) return;
+
+        const bounds = positionSelectableTextLayer(layer, host, img);
+        if (!bounds) return;
+
+        const pdfjs = await ensurePdfJs();
+        const documentProxy = await getPdfDocument(page.sourceFile);
+        const pdfPage = await documentProxy.getPage(page.originalNumber);
+        if (textLayerTokens[target] !== token) return;
+
+        const rotation = ((page.rotation || 0) % 360 + 360) % 360;
+        const baseViewport = pdfPage.getViewport({ scale: 1, rotation });
+        const widthScale = bounds.width / baseViewport.width;
+        const heightScale = bounds.height / baseViewport.height;
+        const scale = Math.max(0.1, Math.min(widthScale, heightScale));
+        const viewport = pdfPage.getViewport({ scale, rotation });
+        const textContent = await pdfPage.getTextContent();
+        if (textLayerTokens[target] !== token) return;
+
+        if (!textContent.items || textContent.items.length === 0) {
+            layer.style.display = 'none';
+            return;
+        }
+
+        layer.style.setProperty('--total-scale-factor', String(scale));
+        layer.innerHTML = '';
+        const textLayer = new pdfjs.TextLayer({
+            textContentSource: textContent,
+            container: layer,
+            viewport
+        });
+        await textLayer.render();
+
+        if (textLayerTokens[target] !== token) return;
+        positionSelectableTextLayer(layer, host, img);
+        layer.classList.add('has-text');
+    } catch (error) {
+        if (textLayerTokens[target] === token) {
+            layer.innerHTML = '';
+            layer.classList.remove('has-text');
+            layer.style.display = 'none';
+        }
     }
 }
 
@@ -840,9 +978,44 @@ function renderVirtualPageRows() {
 
     inner.innerHTML = '';
     inner.appendChild(fragment);
+    updateVisibleChapterMarkerOffsets();
     updateSplitZoneClasses();
     attachGridThumbnailObserver();
     scheduleGridThumbnailLoad();
+}
+
+function updateVisibleChapterMarkerOffsets() {
+    const container = document.getElementById('pages-container');
+    if (!container) return;
+
+    const containerRect = container.getBoundingClientRect();
+    if (!containerRect.width) return;
+
+    const safePadding = 10;
+    const markers = container.querySelectorAll('.grid-chapter-marker');
+
+    markers.forEach(marker => {
+        marker.style.setProperty('--chapter-marker-hover-shift', '0px');
+
+        const markerRect = marker.getBoundingClientRect();
+        const centerX = markerRect.left + (markerRect.width / 2);
+        const markerStyles = window.getComputedStyle(marker);
+        const expandedWidth = parseFloat(markerStyles.getPropertyValue('--chapter-marker-expanded-width')) || 250;
+
+        let shift = 0;
+        const desiredLeft = centerX - (expandedWidth / 2);
+        const desiredRight = centerX + (expandedWidth / 2);
+
+        if (desiredLeft < containerRect.left + safePadding) {
+            shift = (containerRect.left + safePadding) - desiredLeft;
+        }
+
+        if (desiredRight + shift > containerRect.right - safePadding) {
+            shift += (containerRect.right - safePadding) - (desiredRight + shift);
+        }
+
+        marker.style.setProperty('--chapter-marker-hover-shift', `${shift}px`);
+    });
 }
 
 function renderPages() {
@@ -2932,6 +3105,7 @@ async function loadSingleHighResThumbnail(page, navToken = null) {
             if (img) {
                 img.src = url;
                 img.style.display = 'block';
+                renderSelectableTextLayer('reader', page);
             }
         }
     } catch (error) {
@@ -2969,6 +3143,7 @@ async function loadSingleMediumResThumbnail(page, navToken = null) {
             if (img) {
                 img.src = url;
                 img.style.display = 'block';
+                renderSelectableTextLayer('reader', page);
             }
         }
     } catch (error) {
@@ -3020,6 +3195,7 @@ function showReaderPage(index) {
         loadSingleMediumResThumbnail(page, myToken);
     }
     img.style.transform = `rotate(${page.rotation}deg)`;
+    renderSelectableTextLayer('reader', page);
     
     // Seiteninformation aktualisieren
     document.getElementById('reader-page-info').textContent = `${index + 1} / ${state.pages.length}`;
@@ -3131,6 +3307,7 @@ function closePageViewer() {
     if (modal) {
         modal.style.display = 'none';
     }
+    clearSelectableTextLayer('viewer');
     document.body.style.overflow = '';
     viewerHighResThumbnails = {};
     viewerOutlineCache = {};
@@ -3156,6 +3333,7 @@ function showViewerPage(index) {
         img.src = '';
         img.style.display = 'block';
     }
+    renderSelectableTextLayer('viewer', page);
     
     // Update page info
     document.getElementById('viewer-page-info').textContent = `${index + 1} / ${state.pages.length}`;
