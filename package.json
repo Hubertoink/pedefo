@@ -1,6 +1,6 @@
 {
   "name": "pedefo",
-  "version": "0.9.0",
+  "version": "1.0.0",
   "description": "Lightweight lokale PDF-App - Zusammenführen, Aufteilen, Komprimieren",
   "main": "electron-app/main.js",
   "scripts": {
@@ -34,7 +34,8 @@
       "output": "dist"
     },
     "files": [
-      "electron-app/**/*"
+      "electron-app/**/*",
+      "assets/**/*"
     ],
     "extraResources": [
       {
@@ -48,13 +49,14 @@
       }
     ],
     "win": {
+      "artifactName": "${productName}-Setup-${version}.${ext}",
       "target": [
         {
           "target": "nsis",
           "arch": ["x64"]
         }
       ],
-      "icon": "assets/icon_pedefo.ico"
+      "icon": "assets/PedefO_Icon.ico"
     },
     "mac": {
       "target": "dmg",

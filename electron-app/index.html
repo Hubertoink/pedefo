@@ -12,7 +12,15 @@
         <!-- Header -->
         <header class="header">
             <div class="header-left">
-                <span class="logo">Pedefo</span>
+                <div class="brand-lockup" aria-label="Pedefo">
+                    <span class="brand-mark">
+                        <img src="../assets/PedefO_Icon.ico" alt="Pedefo Logo" class="brand-mark-image">
+                    </span>
+                    <span class="brand-copy">
+                        <span class="logo">Pedefo</span>
+                        <span class="brand-subtitle">PDF Editor</span>
+                    </span>
+                </div>
                 <span class="file-name" id="current-file-name"></span>
             </div>
             <div class="header-center" id="toolbar" style="display: none;">
@@ -72,16 +80,30 @@
         <main class="main-content">
             <!-- Upload Screen -->
             <div class="screen active" id="screen-upload">
-                <div class="upload-area" id="upload-dropzone">
-                    <div class="upload-content">
-                        <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
-                            <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
-                            <polyline points="14 2 14 8 20 8"/>
-                            <line x1="12" y1="18" x2="12" y2="12"/>
-                            <line x1="9" y1="15" x2="15" y2="15"/>
-                        </svg>
-                        <h2>PDF-Datei öffnen</h2>
-                        <p>Datei hierher ziehen oder klicken zum Auswählen</p>
+                <div class="upload-shell">
+                    <div class="upload-brand" aria-hidden="true">
+                        <div class="upload-brand-mark">
+                            <span class="upload-brand-halo"></span>
+                            <img src="../assets/PedefO_Icon.ico" alt="" class="upload-brand-image">
+                        </div>
+                        <div class="upload-brand-copy">
+                            <span class="upload-brand-kicker">Lokal. Schnell. Ohne Cloud.</span>
+                            <h1>Pedefo</h1>
+                            <p>Öffne, sortiere und bearbeite PDFs direkt auf deinem Rechner.</p>
+                        </div>
+                    </div>
+
+                    <div class="upload-area" id="upload-dropzone">
+                        <div class="upload-content">
+                            <svg class="upload-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5">
+                                <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+                                <polyline points="14 2 14 8 20 8"/>
+                                <line x1="12" y1="18" x2="12" y2="12"/>
+                                <line x1="9" y1="15" x2="15" y2="15"/>
+                            </svg>
+                            <h2>PDF-Datei öffnen</h2>
+                            <p>Datei hierher ziehen oder klicken zum Auswählen</p>
+                        </div>
                     </div>
                 </div>
             </div>
@@ -420,6 +442,38 @@
         </div>
     </div>
     
+    <!-- Floating Chapter Window -->
+    <button class="btn-floating-outline" id="btn-floating-outline" title="Kapitel anzeigen">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/>
+            <path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/>
+            <path d="M8 7h8"/>
+            <path d="M8 11h6"/>
+        </svg>
+    </button>
+    <div class="floating-outline-panel" id="floating-outline-panel" aria-hidden="true">
+        <div class="floating-outline-header">
+            <span>Kapitel</span>
+            <div class="floating-outline-header-actions">
+                <button class="floating-outline-icon" id="btn-floating-outline-refresh" title="Neu laden">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <polyline points="23 4 23 10 17 10"/>
+                        <path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/>
+                    </svg>
+                </button>
+                <button class="floating-outline-icon" id="btn-floating-outline-close" title="Schließen">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <line x1="18" y1="6" x2="6" y2="18"/>
+                        <line x1="6" y1="6" x2="18" y2="18"/>
+                    </svg>
+                </button>
+            </div>
+        </div>
+        <div class="floating-outline-body" id="floating-outline-body">
+            <div class="floating-outline-empty">Kein Inhaltsverzeichnis gefunden</div>
+        </div>
+    </div>
+
     <!-- Floating Fullscreen Button -->
     <button class="btn-fullscreen-view" id="btn-fullscreen-view" title="Seite in Vollbild anzeigen">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">

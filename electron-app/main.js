@@ -37,7 +37,7 @@ function createWindow() {
             sandbox: false
         },
         titleBarStyle: 'default',
-        icon: path.join(__dirname, '..', 'assets', 'icon_pedefo.ico'),
+        icon: path.join(__dirname, '..', 'assets', 'PedefO_Icon.ico'),
         autoHideMenuBar: !isDev  // Menüleiste in Produktion verstecken
     });
 
@@ -302,6 +302,158 @@ function runPython(script, args, options = {}) {
     });
 }
 
+const zipCrcTable = (() => {
+    const table = new Uint32Array(256);
+    for (let i = 0; i < 256; i++) {
+        let value = i;
+        for (let j = 0; j < 8; j++) {
+            value = (value & 1) ? (0xedb88320 ^ (value >>> 1)) : (value >>> 1);
+        }
+        table[i] = value >>> 0;
+    }
+    return table;
+})();
+
+function crc32(buffer) {
+    let crc = 0xffffffff;
+    for (const byte of buffer) {
+        crc = zipCrcTable[(crc ^ byte) & 0xff] ^ (crc >>> 8);
+    }
+    return (crc ^ 0xffffffff) >>> 0;
+}
+
+function getZipDosDateTime(date = new Date()) {
+    const year = Math.max(1980, date.getFullYear());
+    const dosTime = (date.getHours() << 11) | (date.getMinutes() << 5) | Math.floor(date.getSeconds() / 2);
+    const dosDate = ((year - 1980) << 9) | ((date.getMonth() + 1) << 5) | date.getDate();
+    return { dosTime, dosDate };
+}
+
+function normalizeZipEntryName(name, fallback) {
+    const rawName = path.basename(String(name || fallback || 'datei.pdf'));
+    return rawName
+        .replace(/[<>:"\\|?*\x00-\x1f]/g, '_')
+        .trim() || 'datei.pdf';
+}
+
+function makeUniqueZipEntryName(name, usedNames) {
+    if (!usedNames.has(name)) {
+        usedNames.add(name);
+        return name;
+    }
+
+    const ext = path.extname(name);
+    const stem = path.basename(name, ext);
+    let counter = 2;
+    let nextName;
+    do {
+        nextName = `${stem}_${counter}${ext}`;
+        counter++;
+    } while (usedNames.has(nextName));
+
+    usedNames.add(nextName);
+    return nextName;
+}
+
+async function writeZipArchive(entries, outputPath) {
+    if (!Array.isArray(entries) || entries.length === 0) {
+        throw new Error('Keine Dateien für ZIP angegeben');
+    }
+    if (entries.length > 0xffff) {
+        throw new Error('Zu viele Dateien für ZIP-Export');
+    }
+
+    const localChunks = [];
+    const centralChunks = [];
+    const usedNames = new Set();
+    const { dosTime, dosDate } = getZipDosDateTime();
+    let offset = 0;
+
+    for (const entry of entries) {
+        if (!entry || typeof entry.path !== 'string') {
+            throw new Error('Ungültiger ZIP-Eintrag');
+        }
+
+        const sourcePath = entry.path;
+        const data = await fs.promises.readFile(sourcePath);
+        if (data.length > 0xffffffff) {
+            throw new Error(`Datei ist zu groß für ZIP-Export: ${path.basename(sourcePath)}`);
+        }
+
+        const entryName = makeUniqueZipEntryName(
+            normalizeZipEntryName(entry.name, path.basename(sourcePath)),
+            usedNames
+        );
+        const nameBytes = Buffer.from(entryName, 'utf8');
+        const checksum = crc32(data);
+
+        const localHeader = Buffer.alloc(30);
+        localHeader.writeUInt32LE(0x04034b50, 0);
+        localHeader.writeUInt16LE(20, 4);
+        localHeader.writeUInt16LE(0x0800, 6);
+        localHeader.writeUInt16LE(0, 8);
+        localHeader.writeUInt16LE(dosTime, 10);
+        localHeader.writeUInt16LE(dosDate, 12);
+        localHeader.writeUInt32LE(checksum, 14);
+        localHeader.writeUInt32LE(data.length, 18);
+        localHeader.writeUInt32LE(data.length, 22);
+        localHeader.writeUInt16LE(nameBytes.length, 26);
+        localHeader.writeUInt16LE(0, 28);
+
+        const centralHeader = Buffer.alloc(46);
+        centralHeader.writeUInt32LE(0x02014b50, 0);
+        centralHeader.writeUInt16LE(20, 4);
+        centralHeader.writeUInt16LE(20, 6);
+        centralHeader.writeUInt16LE(0x0800, 8);
+        centralHeader.writeUInt16LE(0, 10);
+        centralHeader.writeUInt16LE(dosTime, 12);
+        centralHeader.writeUInt16LE(dosDate, 14);
+        centralHeader.writeUInt32LE(checksum, 16);
+        centralHeader.writeUInt32LE(data.length, 20);
+        centralHeader.writeUInt32LE(data.length, 24);
+        centralHeader.writeUInt16LE(nameBytes.length, 28);
+        centralHeader.writeUInt16LE(0, 30);
+        centralHeader.writeUInt16LE(0, 32);
+        centralHeader.writeUInt16LE(0, 34);
+        centralHeader.writeUInt16LE(0, 36);
+        centralHeader.writeUInt32LE(0, 38);
+        centralHeader.writeUInt32LE(offset, 42);
+
+        localChunks.push(localHeader, nameBytes, data);
+        centralChunks.push(centralHeader, nameBytes);
+        offset += localHeader.length + nameBytes.length + data.length;
+
+        if (offset > 0xffffffff) {
+            throw new Error('ZIP-Archiv ist zu groß');
+        }
+    }
+
+    const centralDirectoryOffset = offset;
+    const centralDirectorySize = centralChunks.reduce((sum, chunk) => sum + chunk.length, 0);
+    if (centralDirectoryOffset + centralDirectorySize > 0xffffffff) {
+        throw new Error('ZIP-Archiv ist zu groß');
+    }
+
+    const endRecord = Buffer.alloc(22);
+    endRecord.writeUInt32LE(0x06054b50, 0);
+    endRecord.writeUInt16LE(0, 4);
+    endRecord.writeUInt16LE(0, 6);
+    endRecord.writeUInt16LE(entries.length, 8);
+    endRecord.writeUInt16LE(entries.length, 10);
+    endRecord.writeUInt32LE(centralDirectorySize, 12);
+    endRecord.writeUInt32LE(centralDirectoryOffset, 16);
+    endRecord.writeUInt16LE(0, 20);
+
+    await fs.promises.writeFile(outputPath, Buffer.concat([...localChunks, ...centralChunks, endRecord]));
+}
+
+function isInsideTempPath(targetPath) {
+    const tempRoot = path.resolve(app.getPath('temp'));
+    const resolvedTarget = path.resolve(targetPath);
+    const relative = path.relative(tempRoot, resolvedTarget);
+    return relative && !relative.startsWith('..') && !path.isAbsolute(relative);
+}
+
 // ============================================
 // IPC Handler - Kommunikation mit Renderer
 // ============================================
@@ -327,6 +479,14 @@ ipcMain.handle('dialog:saveFile', async (event, defaultName) => {
     const result = await dialog.showSaveDialog(mainWindow, {
         defaultPath: defaultName || 'output.pdf',
         filters: [{ name: 'PDF Dateien', extensions: ['pdf'] }]
+    });
+    return result.filePath;
+});
+
+ipcMain.handle('dialog:saveZipFile', async (event, defaultName) => {
+    const result = await dialog.showSaveDialog(mainWindow, {
+        defaultPath: defaultName || 'export.zip',
+        filters: [{ name: 'ZIP Archive', extensions: ['zip'] }]
     });
     return result.filePath;
 });
@@ -458,6 +618,25 @@ ipcMain.handle('file:getSize', async (event, filePath) => {
     }
 });
 
+ipcMain.handle('file:createTempDir', async (event, prefix = 'pedefo') => {
+    const safePrefix = String(prefix || 'pedefo')
+        .replace(/[^a-zA-Z0-9_-]/g, '_')
+        .slice(0, 40) || 'pedefo';
+    return fs.promises.mkdtemp(path.join(app.getPath('temp'), `${safePrefix}-`));
+});
+
+ipcMain.handle('file:removeTempPath', async (event, targetPath) => {
+    try {
+        if (!targetPath || typeof targetPath !== 'string' || !isInsideTempPath(targetPath)) {
+            throw new Error('Ungültiger temporärer Pfad');
+        }
+        await fs.promises.rm(targetPath, { recursive: true, force: true });
+        return { success: true };
+    } catch (error) {
+        return { success: false, message: error.message };
+    }
+});
+
 ipcMain.handle('file:readBinary', async (event, filePath) => {
     try {
         if (!filePath || typeof filePath !== 'string') {
@@ -476,6 +655,18 @@ ipcMain.handle('file:openPath', async (event, filePath) => {
         if (!filePath) throw new Error('Kein Pfad angegeben');
         await shell.openPath(filePath);
         return { success: true };
+    } catch (error) {
+        return { success: false, message: error.message };
+    }
+});
+
+ipcMain.handle('archive:createZip', async (event, entries, outputPath) => {
+    try {
+        if (!outputPath || typeof outputPath !== 'string') {
+            throw new Error('Kein ZIP-Ausgabepfad angegeben');
+        }
+        await writeZipArchive(entries, outputPath);
+        return { success: true, message: 'ZIP erfolgreich erstellt', data: { output: outputPath, entries: entries.length } };
     } catch (error) {
         return { success: false, message: error.message };
     }

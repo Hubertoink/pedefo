@@ -19,6 +19,19 @@ const state = {
 let pageIndexById = new Map();
 let renderPagesToken = 0;
 
+const gridVirtual = {
+    rowHeight: 240,
+    overscanRows: 3,
+    pageWidth: 140,
+    insertWidth: 40,
+    gap: 8,
+    inner: null,
+    scrollAttached: false,
+    renderScheduled: false,
+    pagesPerRow: 1,
+    resizeObserver: null
+};
+
 const pdfRender = {
     pdfjsReady: null,
     documents: new Map(),
@@ -34,6 +47,7 @@ const pdfRender = {
 // Grid thumbnail visibility tracking (avoids scanning all cards on scroll)
 let gridThumbObserver = null;
 let gridVisiblePageIds = new Set();
+let gridChapterMarkersByInsertIndex = new Map();
 
 // Reader thumbnail visibility tracking
 let readerThumbObserver = null;
@@ -105,7 +119,8 @@ function clearRenderedImages() {
 }
 
 function getPageRenderKey(page, variant, maxWidth, maxHeight) {
-    return `${page.sourceFile}|${page.originalNumber}|${variant}|${maxWidth}|${maxHeight || 0}`;
+    const sharedVariant = (variant === 'grid' || variant === 'reader-thumb') ? 'thumb' : variant;
+    return `${page.sourceFile}|${page.originalNumber}|${sharedVariant}|${maxWidth}|${maxHeight || 0}`;
 }
 
 function schedulePdfPageRender(page, options = {}) {
@@ -274,6 +289,20 @@ function getBaseName(filePath) {
     return filePath.split(/[\\/]/).pop();
 }
 
+function normalizePdfFilePaths(files) {
+    return Array.from(files || [])
+        .map(file => typeof file === 'string' ? file : file?.path)
+        .filter(filePath => filePath && filePath.toLowerCase().endsWith('.pdf'));
+}
+
+function getPdfFilePathsFromDataTransfer(dataTransfer) {
+    return normalizePdfFilePaths(dataTransfer?.files);
+}
+
+function isExternalFileDrag(event) {
+    return Array.from(event.dataTransfer?.types || []).includes('Files');
+}
+
 function escapeHtml(value) {
     return String(value || '').replace(/[&<>"']/g, (char) => ({
         '&': '&amp;',
@@ -304,6 +333,7 @@ function showScreen(screenId) {
     document.getElementById('btn-save').style.display = showControls ? 'flex' : 'none';
     document.getElementById('btn-new').style.display = showControls ? 'block' : 'none';
     document.getElementById('status-bar').style.display = isEditor ? 'flex' : 'none';
+    updateFloatingButtons();
 }
 
 // ============================================
@@ -368,6 +398,46 @@ function setupUploadZone() {
     });
 }
 
+function setupEditorFileDropZone() {
+    const container = document.getElementById('pages-container');
+    if (!container) return;
+
+    const activateDropState = (e) => {
+        if (!isExternalFileDrag(e)) return false;
+        e.preventDefault();
+        e.stopPropagation();
+        e.dataTransfer.dropEffect = 'copy';
+        setEditorFileDragState(true);
+        return true;
+    };
+
+    container.addEventListener('dragenter', activateDropState);
+    container.addEventListener('dragover', activateDropState);
+
+    container.addEventListener('dragleave', (e) => {
+        if (!isExternalFileDrag(e)) return;
+        if (!container.contains(e.relatedTarget)) {
+            setEditorFileDragState(false);
+        }
+    });
+
+    container.addEventListener('drop', async (e) => {
+        if (!isExternalFileDrag(e)) return;
+        if (e.target.closest('.insert-zone')) return;
+        e.preventDefault();
+        e.stopPropagation();
+        setEditorFileDragState(false);
+
+        const filePaths = getPdfFilePathsFromDataTransfer(e.dataTransfer);
+        if (filePaths.length === 0) {
+            showToast('Bitte eine PDF-Datei auswählen', 'error');
+            return;
+        }
+
+        await insertPdfFilesAt(filePaths, state.pages.length);
+    });
+}
+
 // ============================================
 // PDF Loading & Page Rendering
 // ============================================
@@ -386,6 +456,8 @@ async function loadPDF(filePath) {
         state.selectedPages.clear();
         state.isDirty = false;
         outlineCache = {};
+        expandedOutlineKeys.clear();
+        hideFloatingOutlinePanel();
         readerHighResThumbnails = {};
         gridThumbConfig = {};
         
@@ -412,6 +484,8 @@ async function loadPDF(filePath) {
         
         // Generate thumbnails with PDF.js render queue
         generateThumbnailsWithPoppler(filePath);
+
+        loadOutlineForSources().catch(() => {});
         
         showToast(`${pageCount} Seiten geladen`, 'success');
         
@@ -692,53 +766,106 @@ function getVisiblePagesInGridLegacy() {
     return visiblePages;
 }
 
+function getGridPagesPerRow(container) {
+    const styles = window.getComputedStyle(container);
+    const paddingLeft = parseFloat(styles.paddingLeft) || 0;
+    const paddingRight = parseFloat(styles.paddingRight) || 0;
+    const availableWidth = Math.max(0, container.clientWidth - paddingLeft - paddingRight);
+    const slotWidth = gridVirtual.pageWidth + gridVirtual.insertWidth + (gridVirtual.gap * 2);
+    return Math.max(1, Math.floor((availableWidth - gridVirtual.insertWidth) / slotWidth));
+}
+
+function attachGridVirtualHandlers(container) {
+    if (!gridVirtual.scrollAttached) {
+        container.addEventListener('scroll', scheduleVirtualPageRender);
+        gridVirtual.scrollAttached = true;
+    }
+
+    if (!gridVirtual.resizeObserver && 'ResizeObserver' in window) {
+        gridVirtual.resizeObserver = new ResizeObserver(() => scheduleVirtualPageRender(true));
+        gridVirtual.resizeObserver.observe(container);
+    }
+}
+
+function scheduleVirtualPageRender(force = false) {
+    if (gridVirtual.renderScheduled && !force) return;
+    gridVirtual.renderScheduled = true;
+    requestAnimationFrame(() => {
+        gridVirtual.renderScheduled = false;
+        renderVirtualPageRows();
+    });
+}
+
+function renderVirtualPageRows() {
+    const container = document.getElementById('pages-container');
+    const inner = gridVirtual.inner;
+    if (!container || !inner) return;
+
+    const total = state.pages.length;
+    const pagesPerRow = getGridPagesPerRow(container);
+    gridVirtual.pagesPerRow = pagesPerRow;
+
+    const rowCount = Math.ceil(total / pagesPerRow);
+    inner.style.height = `${rowCount * gridVirtual.rowHeight}px`;
+    rebuildGridChapterMarkers();
+
+    if (total === 0) {
+        inner.innerHTML = '';
+        return;
+    }
+
+    const firstRow = Math.max(0, Math.floor(container.scrollTop / gridVirtual.rowHeight) - gridVirtual.overscanRows);
+    const lastRow = Math.min(
+        rowCount - 1,
+        Math.ceil((container.scrollTop + container.clientHeight) / gridVirtual.rowHeight) + gridVirtual.overscanRows
+    );
+
+    const fragment = document.createDocumentFragment();
+    for (let row = firstRow; row <= lastRow; row++) {
+        const startIndex = row * pagesPerRow;
+        if (startIndex >= total) break;
+        const endIndex = Math.min(total, startIndex + pagesPerRow);
+        const rowEl = document.createElement('div');
+        rowEl.className = 'pages-virtual-row';
+        rowEl.style.transform = `translateY(${row * gridVirtual.rowHeight}px)`;
+        rowEl.dataset.row = row;
+
+        rowEl.appendChild(createInsertZone(startIndex));
+        for (let index = startIndex; index < endIndex; index++) {
+            rowEl.appendChild(createPageCard(state.pages[index], index));
+            rowEl.appendChild(createInsertZone(index + 1));
+        }
+        fragment.appendChild(rowEl);
+    }
+
+    inner.innerHTML = '';
+    inner.appendChild(fragment);
+    updateSplitZoneClasses();
+    attachGridThumbnailObserver();
+    scheduleGridThumbnailLoad();
+}
+
 function renderPages() {
     const container = document.getElementById('pages-container');
     if (!container) return;
 
     rebuildPageIndexById();
 
-    // Cancel any in-flight progressive render
-    const myToken = ++renderPagesToken;
+    ++renderPagesToken;
+    const previousScrollTop = container.scrollTop;
     container.innerHTML = '';
+    container.classList.add('virtualized');
 
-    const total = state.pages.length;
-    const batchSize = total > 400 ? 20 : 60;
-    let index = 0;
+    const inner = document.createElement('div');
+    inner.className = 'pages-virtual-spacer';
+    container.appendChild(inner);
+    gridVirtual.inner = inner;
+    container.scrollTop = Math.min(previousScrollTop, Math.max(0, state.pages.length * gridVirtual.rowHeight));
 
-    const renderBatch = () => {
-        if (myToken !== renderPagesToken) return;
-
-        const frag = document.createDocumentFragment();
-        let added = 0;
-        while (added < batchSize && index < total) {
-            // Insert zone before first page
-            if (index === 0) {
-                frag.appendChild(createInsertZone(0));
-            }
-
-            const page = state.pages[index];
-            frag.appendChild(createPageCard(page, index));
-            frag.appendChild(createInsertZone(index + 1));
-
-            index++;
-            added++;
-        }
-
-        container.appendChild(frag);
-
-        if (index < total) {
-            requestAnimationFrame(renderBatch);
-        } else {
-            updateSelectionBar();
-            updateSplitIndicators();
-            attachGridThumbnailObserver();
-            scheduleGridThumbnailLoad();
-        }
-    };
-
-    // Kick off progressive render (keeps UI responsive on huge PDFs)
-    requestAnimationFrame(renderBatch);
+    attachGridVirtualHandlers(container);
+    renderVirtualPageRows();
+    updateSelectionBar();
+    renderSplitPanel();
 }
 
 function createPageCard(page, index) {
@@ -765,24 +892,24 @@ function createPageCard(page, index) {
             ${chapterBadge}
             <div class="page-thumbnail">${thumbnailContent}</div>
             <div class="page-actions">
-                <button class="page-action-btn" data-action="chapter" title="Kapitel setzen">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
-                        <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
-                    </svg>
-                </button>
-                <button class="page-action-btn" data-action="rotate-left" title="Links drehen">
+                <button class="page-action-btn action-rotate" data-action="rotate-left" title="Links drehen">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M2.5 2v6h6"/>
                         <path d="M2.5 8C5.5 3 11 1.5 16 4s8 9 6 15"/>
                     </svg>
                 </button>
-                <button class="page-action-btn" data-action="rotate-right" title="Rechts drehen">
+                <button class="page-action-btn action-rotate" data-action="rotate-right" title="Rechts drehen">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <path d="M21.5 2v6h-6"/>
                         <path d="M21.5 8C18.5 3 13 1.5 8 4S0 13 2 19"/>
                     </svg>
                 </button>
-                <button class="page-action-btn" data-action="duplicate" title="Duplizieren">
+                <button class="page-action-btn action-chapter" data-action="chapter" title="Kapitel setzen">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                        <path d="M19 21l-7-5-7 5V5a2 2 0 0 1 2-2h10a2 2 0 0 1 2 2z"/>
+                    </svg>
+                </button>
+                <button class="page-action-btn action-duplicate" data-action="duplicate" title="Duplizieren">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
                         <rect x="9" y="9" width="13" height="13" rx="2"/>
                         <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>
@@ -798,58 +925,28 @@ function createPageCard(page, index) {
         </div>
         <span class="page-number">${index + 1}</span>
     `;
-    
-    // Checkbox click toggles selection
-    card.querySelector('.page-checkbox').addEventListener('click', (e) => {
-        e.stopPropagation();
-        togglePageSelection(page.id);
-    });
 
-    // Click to select (additive by default)
-    card.addEventListener('click', (e) => {
-        if (e.target.closest('.page-actions')) return;
-
-        state.lastFocusedPageId = page.id;
-        
-        if (e.shiftKey && state.selectedPages.size > 0) {
-            // Shift-click for range selection
-            const lastSelected = Array.from(state.selectedPages).pop();
-            const lastIndex = state.pages.findIndex(p => p.id === lastSelected);
-            const currentIndex = index;
-            const [start, end] = [Math.min(lastIndex, currentIndex), Math.max(lastIndex, currentIndex)];
-            
-            for (let i = start; i <= end; i++) {
-                state.selectedPages.add(state.pages[i].id);
-            }
-            updatePageSelectionUI();
-            updateSelectionBar();
-        } else {
-            // Additive toggle (kein Ctrl nötig)
-            togglePageSelection(page.id);
-        }
-    });
-    
-    // Page action buttons
-    card.querySelectorAll('.page-action-btn').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const action = btn.dataset.action;
-            handlePageAction(action, page.id);
-        });
-    });
-    
-    // Drag & Drop
-    setupPageDragDrop(card, page.id);
-    
     return card;
 }
 
 function createInsertZone(insertIndex) {
+    const chapterMarker = gridChapterMarkersByInsertIndex.get(insertIndex);
     const zone = document.createElement('div');
-    zone.className = 'insert-zone';
+    zone.className = 'insert-zone' + (chapterMarker ? ' chapter-start' : '');
     zone.dataset.insertIndex = insertIndex;
+    const chapterMarkerHtml = chapterMarker ? `
+        <div class="grid-chapter-marker" data-source-file="${escapeHtml(chapterMarker.sourceFile)}" data-start-page="${chapterMarker.startPage}" data-end-page="${chapterMarker.endPage || ''}" data-title="${escapeHtml(chapterMarker.title)}" data-target-index="${chapterMarker.targetIndex}">
+            <span class="grid-chapter-rail"></span>
+            <button class="grid-chapter-jump" title="Zum Kapitel springen">
+                <span class="grid-chapter-title">${escapeHtml(chapterMarker.title)}</span>
+                <span class="grid-chapter-range">${escapeHtml(chapterMarker.rangeText)}</span>
+            </button>
+            <button class="grid-chapter-export" title="Kapitel exportieren">Export</button>
+        </div>
+    ` : '';
     
     zone.innerHTML = `
+        ${chapterMarkerHtml}
         <div class="insert-drop-indicator"></div>
         <div class="insert-actions">
             <button class="insert-btn" title="PDF hier einfügen">
@@ -868,18 +965,7 @@ function createInsertZone(insertIndex) {
             </button>
         </div>
     `;
-    
-    zone.querySelector('.insert-btn').addEventListener('click', () => {
-        insertPDFAt(insertIndex);
-    });
-    
-    zone.querySelector('.insert-split-btn').addEventListener('click', () => {
-        toggleSplitPoint(insertIndex);
-    });
-    
-    // Drag & Drop für Seiten-Neuordnung
-    setupInsertZoneDragDrop(zone, insertIndex);
-    
+
     return zone;
 }
 
@@ -945,13 +1031,60 @@ function computeSplitParts() {
     return parts;
 }
 
-function updateSplitIndicators() {
+function rebuildGridChapterMarkers() {
+    const markers = new Map();
+    const files = Array.from(new Set(state.pages.map(page => page.sourceFile)));
+    const multipleSources = files.length > 1;
+
+    files.forEach((sourceFile) => {
+        const outline = outlineCache[sourceFile];
+        if (!Array.isArray(outline) || outline.length === 0) return;
+
+        const sourceMaxPage = getMaxOriginalPageForSource(sourceFile);
+        outline.forEach((entry, index) => {
+            const startPage = parseOutlinePageNumber(entry?.page);
+            if (startPage === null) return;
+
+            const targetIndex = findPageIndexForOutline(sourceFile, startPage);
+            if (targetIndex === -1 || markers.has(targetIndex)) return;
+
+            const boundaryPage = findNextOutlineBoundaryPage(outline, index, startPage, null);
+            const endPage = boundaryPage !== null ? boundaryPage - 1 : sourceMaxPage;
+            const titlePrefix = multipleSources ? `${getBaseName(sourceFile)} · ` : '';
+            const title = `${titlePrefix}${entry.title || 'Ohne Titel'}`;
+
+            markers.set(targetIndex, {
+                sourceFile,
+                startPage,
+                endPage,
+                title,
+                rangeText: formatOutlinePageRange(startPage, endPage),
+                targetIndex
+            });
+        });
+    });
+
+    gridChapterMarkersByInsertIndex = markers;
+}
+
+function refreshGridChapterMarkers() {
+    if (!isEditorScreenActive()) return;
+    if (gridVirtual.inner) {
+        renderVirtualPageRows();
+    }
+}
+
+function updateSplitZoneClasses() {
     const points = new Set(getSplitPointsSorted());
     document.querySelectorAll('.insert-zone').forEach(zone => {
         const idx = parseInt(zone.dataset.insertIndex, 10);
         const active = points.has(idx);
         zone.classList.toggle('split-active', active);
     });
+}
+
+function updateSplitIndicators() {
+    updateSplitZoneClasses();
     renderSplitPanel();
 }
 
@@ -1001,28 +1134,72 @@ function sanitizeFilename(name) {
         .replace(/^_+|_+$/g, '') || 'datei';
 }
 
+function joinFilePath(directory, fileName) {
+    const separator = directory.includes('\\') ? '\\' : '/';
+    return `${directory.replace(/[\\/]$/, '')}${separator}${fileName}`;
+}
+
 function updateSelectionBar() {
     const bar = document.getElementById('selection-bar');
     const count = state.selectedPages.size;
-    const fullscreenBtn = document.getElementById('btn-fullscreen-view');
     
     if (count > 0) {
         bar.style.display = 'flex';
         document.getElementById('selection-count').textContent = 
             count === 1 ? '1 Seite ausgewählt' : `${count} Seiten ausgewählt`;
-        
-        // Show fullscreen button
-        if (fullscreenBtn) {
-            fullscreenBtn.style.display = 'flex';
-        }
     } else {
         bar.style.display = 'none';
-        
-        // Hide fullscreen button
-        if (fullscreenBtn) {
-            fullscreenBtn.style.display = 'none';
-        }
     }
+
+    updateFloatingButtons();
+}
+
+function isEditorScreenActive() {
+    return document.getElementById('screen-editor')?.classList.contains('active');
+}
+
+function updateFloatingButtons() {
+    const fullscreenBtn = document.getElementById('btn-fullscreen-view');
+    const outlineBtn = document.getElementById('btn-floating-outline');
+    const showEditorButtons = isEditorScreenActive() && state.pages.length > 0;
+
+    if (fullscreenBtn) {
+        fullscreenBtn.style.display = showEditorButtons && state.selectedPages.size > 0 ? 'flex' : 'none';
+    }
+
+    if (outlineBtn) {
+        outlineBtn.style.display = showEditorButtons ? 'flex' : 'none';
+    }
+
+    if (!showEditorButtons) {
+        hideFloatingOutlinePanel();
+    }
+}
+
+function focusGridPage(index) {
+    const page = state.pages[index];
+    if (!page) return;
+
+    state.lastFocusedPageId = page.id;
+    state.selectedPages.clear();
+    state.selectedPages.add(page.id);
+    updatePageSelectionUI();
+    updateSelectionBar();
+
+    requestAnimationFrame(() => {
+        const container = document.getElementById('pages-container');
+        if (container?.classList.contains('virtualized')) {
+            const pagesPerRow = Math.max(1, gridVirtual.pagesPerRow || getGridPagesPerRow(container));
+            const targetRow = Math.floor(index / pagesPerRow);
+            container.scrollTo({ top: targetRow * gridVirtual.rowHeight, behavior: 'smooth' });
+            scheduleVirtualPageRender(true);
+        }
+
+        const card = document.querySelector(`.page-card[data-page-id="${page.id}"]`);
+        if (card) {
+            card.scrollIntoView({ behavior: 'smooth', block: 'center', inline: 'nearest' });
+        }
+    });
 }
 
 function renderSplitPanel() {
@@ -1053,7 +1230,21 @@ function renderSplitPanel() {
         `;
     }).join('');
 
-    panel.innerHTML = list;
+    panel.innerHTML = `
+        <div class="split-panel-header">
+            <div>
+                <div class="split-panel-title">PDF teilen</div>
+                <div class="split-panel-subtitle">${parts.length} Teile vorbereitet</div>
+            </div>
+            <button class="split-export-all">Alle exportieren</button>
+        </div>
+        ${list}
+    `;
+
+    panel.querySelector('.split-export-all')?.addEventListener('click', async () => {
+        const partsNow = computeSplitParts();
+        await exportAllSplitParts(partsNow, baseName);
+    });
 
     panel.querySelectorAll('.split-remove').forEach(btn => {
         btn.addEventListener('click', () => {
@@ -1074,6 +1265,10 @@ function renderSplitPanel() {
     });
 }
 
+function getSplitPartFileName(baseName, number) {
+    return `${baseName}_Teil${number}.pdf`;
+}
+
 async function exportSplitPart(part, number, baseName) {
     const pages = state.pages.slice(part.start, part.end);
     if (pages.length === 0) {
@@ -1081,7 +1276,7 @@ async function exportSplitPart(part, number, baseName) {
         return;
     }
 
-    const defaultName = `${baseName}_Teil${number}.pdf`;
+    const defaultName = getSplitPartFileName(baseName, number);
     const output = await window.pedefo.saveFile(defaultName);
     if (!output) return;
 
@@ -1096,6 +1291,62 @@ async function exportSplitPart(part, number, baseName) {
     } catch (error) {
         showToast(error.message, 'error');
     } finally {
+        hideLoading();
+    }
+}
+
+async function exportAllSplitParts(parts, baseName) {
+    if (!parts || parts.length <= 1) {
+        showToast('Keine Teilung vorbereitet', 'error');
+        return;
+    }
+
+    const output = await window.pedefo.saveZipFile(`${baseName}_Teile.zip`);
+    if (!output) return;
+
+    let tempDir = null;
+    showLoading('Exportiere alle Teile...', {
+        progress: true,
+        percent: 0,
+        detail: 'Bereite ZIP-Export vor...'
+    });
+
+    try {
+        tempDir = await window.pedefo.file.createTempDir('pedefo-split');
+        const entries = [];
+
+        for (let index = 0; index < parts.length; index++) {
+            const part = parts[index];
+            const pages = state.pages.slice(part.start, part.end);
+            if (pages.length === 0) {
+                throw new Error(`Teil ${index + 1} ist leer`);
+            }
+
+            const fileName = getSplitPartFileName(baseName, index + 1);
+            const tempOutput = joinFilePath(tempDir, fileName);
+            setLoadingProgress(Math.round((index / parts.length) * 85), `Teil ${index + 1} von ${parts.length} wird erstellt...`);
+
+            const result = await buildPdfForPages(pages, tempOutput);
+            if (!result.success) {
+                throw new Error(result.message || `Teil ${index + 1} konnte nicht exportiert werden`);
+            }
+
+            entries.push({ name: fileName, path: tempOutput });
+        }
+
+        setLoadingProgress(92, 'ZIP-Archiv wird erstellt...');
+        const zipResult = await window.pedefo.archive.createZip(entries, output);
+        if (!zipResult.success) {
+            throw new Error(zipResult.message || 'ZIP-Archiv konnte nicht erstellt werden');
+        }
+
+        showToast(`${parts.length} Teile als ZIP exportiert`, 'success');
+    } catch (error) {
+        showToast(error.message, 'error');
+    } finally {
+        if (tempDir) {
+            await window.pedefo.file.removeTempPath(tempDir);
+        }
         hideLoading();
     }
 }
@@ -1241,6 +1492,7 @@ function refreshChapterViews() {
     renderPages();
     renderOutlinePanel();
     renderViewerOutline();
+    renderFloatingOutline();
     updateViewerActions();
     if (document.getElementById('screen-reader')?.classList.contains('active')) {
         renderReaderThumbnails();
@@ -1344,83 +1596,226 @@ function deletePages(pageIds) {
 // ============================================
 
 let draggedPageId = null;
+let pageGridDelegatedEventsAttached = false;
 
-function setupPageDragDrop(card, pageId) {
-    card.addEventListener('dragstart', (e) => {
-        draggedPageId = pageId;
-        e.dataTransfer.setData('text/plain', pageId);
-        e.dataTransfer.effectAllowed = 'move';
-        
-        // Verzögert die Klasse hinzufügen für bessere visuelle Darstellung
-        setTimeout(() => {
-            card.classList.add('dragging');
-            // Alle Insert-Zonen während des Drags hervorheben
-            document.querySelectorAll('.insert-zone').forEach(zone => {
-                zone.classList.add('drag-active');
-            });
-        }, 0);
-    });
-    
-    card.addEventListener('dragend', () => {
-        draggedPageId = null;
-        card.classList.remove('dragging');
-        // Alle Hervorhebungen entfernen
-        document.querySelectorAll('.insert-zone').forEach(zone => {
-            zone.classList.remove('drag-active', 'drag-over');
-        });
+function clearInsertZoneDragState() {
+    document.querySelectorAll('.insert-zone').forEach(zone => {
+        zone.classList.remove('drag-active', 'drag-over');
     });
 }
 
-function setupInsertZoneDragDrop(zone, insertIndex) {
-    zone.addEventListener('dragover', (e) => {
-        e.preventDefault();
-        e.dataTransfer.dropEffect = 'move';
-        zone.classList.add('drag-over');
+function setEditorFileDragState(active) {
+    document.getElementById('pages-container')?.classList.toggle('file-dragover', active);
+    document.querySelectorAll('.insert-zone').forEach(zone => {
+        zone.classList.toggle('drag-active', active);
+        if (!active) zone.classList.remove('drag-over');
     });
-    
-    zone.addEventListener('dragleave', (e) => {
-        // Nur entfernen wenn wir wirklich die Zone verlassen
-        if (!zone.contains(e.relatedTarget)) {
-            zone.classList.remove('drag-over');
-        }
-    });
-    
-    zone.addEventListener('drop', (e) => {
+}
+
+function getGridInsertZone(target) {
+    const container = document.getElementById('pages-container');
+    const zone = target?.closest?.('.insert-zone');
+    return zone && container?.contains(zone) ? zone : null;
+}
+
+function getInsertIndexFromZone(zone) {
+    return Math.max(0, Math.min(parseInt(zone?.dataset?.insertIndex, 10) || 0, state.pages.length));
+}
+
+function setupPageGridDelegatedEvents() {
+    if (pageGridDelegatedEventsAttached) return;
+    const container = document.getElementById('pages-container');
+    if (!container) return;
+
+    container.addEventListener('click', handlePageGridClick);
+    container.addEventListener('dragstart', handlePageGridDragStart);
+    container.addEventListener('dragend', handlePageGridDragEnd);
+    container.addEventListener('dragover', handlePageGridDragOver);
+    container.addEventListener('dragleave', handlePageGridDragLeave);
+    container.addEventListener('drop', handlePageGridDrop);
+    pageGridDelegatedEventsAttached = true;
+}
+
+async function handlePageGridClick(e) {
+    const chapterExportButton = e.target.closest('.grid-chapter-export');
+    if (chapterExportButton) {
+        const marker = chapterExportButton.closest('.grid-chapter-marker');
+        if (!marker) return;
         e.preventDefault();
-        zone.classList.remove('drag-over');
-        
-        const draggedId = e.dataTransfer.getData('text/plain');
-        
-        if (draggedId) {
-            const draggedIndex = state.pages.findIndex(p => p.id === draggedId);
-            
-            if (draggedIndex !== -1) {
-                // Berechne die tatsächliche Zielposition
-                let targetIndex = insertIndex;
-                
-                // Wenn wir nach der aktuellen Position einfügen, müssen wir die Position anpassen
-                if (draggedIndex < targetIndex) {
-                    targetIndex--;
-                }
-                
-                // Nur verschieben wenn es eine tatsächliche Änderung gibt
-                if (draggedIndex !== targetIndex) {
-                    const [removed] = state.pages.splice(draggedIndex, 1);
-                    state.pages.splice(targetIndex, 0, removed);
-                    clampSplitPoints();
-                    
-                    state.isDirty = true;
-                    renderPages();
-                    showToast('Seite verschoben', 'info');
-                }
-            }
+        e.stopPropagation();
+        await extractOutlineChapter(
+            marker.dataset.sourceFile,
+            marker.dataset.startPage,
+            marker.dataset.endPage,
+            marker.dataset.title
+        );
+        return;
+    }
+
+    const chapterJumpButton = e.target.closest('.grid-chapter-jump');
+    if (chapterJumpButton) {
+        const marker = chapterJumpButton.closest('.grid-chapter-marker');
+        const targetIndex = parseInt(marker?.dataset?.targetIndex, 10);
+        if (Number.isNaN(targetIndex)) return;
+        e.preventDefault();
+        e.stopPropagation();
+        focusGridPage(targetIndex);
+        return;
+    }
+
+    const insertButton = e.target.closest('.insert-btn');
+    if (insertButton) {
+        const zone = getGridInsertZone(insertButton);
+        if (!zone) return;
+        e.preventDefault();
+        e.stopPropagation();
+        await insertPDFAt(getInsertIndexFromZone(zone));
+        return;
+    }
+
+    const splitButton = e.target.closest('.insert-split-btn');
+    if (splitButton) {
+        const zone = getGridInsertZone(splitButton);
+        if (!zone) return;
+        e.preventDefault();
+        e.stopPropagation();
+        toggleSplitPoint(getInsertIndexFromZone(zone));
+        return;
+    }
+
+    const actionButton = e.target.closest('.page-action-btn');
+    if (actionButton) {
+        const card = actionButton.closest('.page-card');
+        if (!card) return;
+        e.preventDefault();
+        e.stopPropagation();
+        handlePageAction(actionButton.dataset.action, card.dataset.pageId);
+        return;
+    }
+
+    const checkbox = e.target.closest('.page-checkbox');
+    if (checkbox) {
+        const card = checkbox.closest('.page-card');
+        if (!card) return;
+        e.stopPropagation();
+        togglePageSelection(card.dataset.pageId);
+        return;
+    }
+
+    const card = e.target.closest('.page-card');
+    if (!card || e.target.closest('.page-actions')) return;
+
+    const pageId = card.dataset.pageId;
+    const currentIndex = pageIndexById.get(pageId);
+    if (typeof currentIndex !== 'number') return;
+
+    state.lastFocusedPageId = pageId;
+
+    if (e.shiftKey && state.selectedPages.size > 0) {
+        const lastSelected = Array.from(state.selectedPages).pop();
+        const lastIndex = pageIndexById.get(lastSelected);
+        if (typeof lastIndex !== 'number') {
+            togglePageSelection(pageId);
+            return;
         }
-        
-        // Alle Hervorhebungen entfernen
-        document.querySelectorAll('.insert-zone').forEach(z => {
-            z.classList.remove('drag-active', 'drag-over');
+
+        const [start, end] = [Math.min(lastIndex, currentIndex), Math.max(lastIndex, currentIndex)];
+        for (let i = start; i <= end; i++) {
+            state.selectedPages.add(state.pages[i].id);
+        }
+        updatePageSelectionUI();
+        updateSelectionBar();
+    } else {
+        togglePageSelection(pageId);
+    }
+}
+
+function handlePageGridDragStart(e) {
+    const card = e.target.closest('.page-card');
+    if (!card) return;
+
+    draggedPageId = card.dataset.pageId;
+    e.dataTransfer.setData('text/plain', draggedPageId);
+    e.dataTransfer.effectAllowed = 'move';
+
+    setTimeout(() => {
+        if (!draggedPageId) return;
+        card.classList.add('dragging');
+        document.querySelectorAll('.insert-zone').forEach(zone => {
+            zone.classList.add('drag-active');
         });
+    }, 0);
+}
+
+function handlePageGridDragEnd(e) {
+    e.target.closest('.page-card')?.classList.remove('dragging');
+    draggedPageId = null;
+    clearInsertZoneDragState();
+}
+
+function handlePageGridDragOver(e) {
+    const zone = getGridInsertZone(e.target);
+    if (!zone || (!draggedPageId && !isExternalFileDrag(e))) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    e.dataTransfer.dropEffect = isExternalFileDrag(e) ? 'copy' : 'move';
+
+    document.querySelectorAll('.insert-zone.drag-over').forEach(activeZone => {
+        if (activeZone !== zone) activeZone.classList.remove('drag-over');
     });
+    zone.classList.add('drag-over');
+}
+
+function handlePageGridDragLeave(e) {
+    const zone = getGridInsertZone(e.target);
+    if (!zone) return;
+    if (!zone.contains(e.relatedTarget)) {
+        zone.classList.remove('drag-over');
+    }
+}
+
+async function handlePageGridDrop(e) {
+    const zone = getGridInsertZone(e.target);
+    if (!zone || (!draggedPageId && !isExternalFileDrag(e))) return;
+
+    e.preventDefault();
+    e.stopPropagation();
+    if (typeof e.stopImmediatePropagation === 'function') e.stopImmediatePropagation();
+    zone.classList.remove('drag-over');
+
+    const insertIndex = getInsertIndexFromZone(zone);
+    const droppedPdfPaths = getPdfFilePathsFromDataTransfer(e.dataTransfer);
+    if (droppedPdfPaths.length > 0 || isExternalFileDrag(e)) {
+        setEditorFileDragState(false);
+        if (droppedPdfPaths.length === 0) {
+            showToast('Bitte eine PDF-Datei auswählen', 'error');
+        } else {
+            await insertPdfFilesAt(droppedPdfPaths, insertIndex);
+        }
+        clearInsertZoneDragState();
+        return;
+    }
+
+    const draggedId = e.dataTransfer.getData('text/plain');
+    const draggedIndex = state.pages.findIndex(p => p.id === draggedId);
+    if (draggedIndex !== -1) {
+        let targetIndex = insertIndex;
+        if (draggedIndex < targetIndex) {
+            targetIndex--;
+        }
+
+        if (draggedIndex !== targetIndex) {
+            const [removed] = state.pages.splice(draggedIndex, 1);
+            state.pages.splice(targetIndex, 0, removed);
+            clampSplitPoints();
+            state.isDirty = true;
+            renderPages();
+            showToast('Seite verschoben', 'info');
+        }
+    }
+
+    clearInsertZoneDragState();
 }
 
 // ============================================
@@ -1430,27 +1825,48 @@ function setupInsertZoneDragDrop(zone, insertIndex) {
 async function insertPDFAt(insertIndex) {
     const files = await window.pedefo.openFiles();
     if (!files || files.length === 0) return;
-    
-    showLoading('Füge PDF ein...');
-    
+
+    await insertPdfFilesAt(files, insertIndex);
+}
+
+async function insertPdfFilesAt(files, insertIndex) {
+    const filePaths = normalizePdfFilePaths(files);
+    if (filePaths.length === 0) {
+        showToast('Bitte eine PDF-Datei auswählen', 'error');
+        return false;
+    }
+
+    const safeInsertIndex = Math.max(0, Math.min(Number(insertIndex) || 0, state.pages.length));
+    const loadingText = filePaths.length === 1 ? 'Füge PDF ein...' : 'Füge PDFs ein...';
+    const insertedSources = [];
+    let totalPageCount = 0;
+
+    showLoading(loadingText);
+
     try {
-        const filePath = files[0];
-        const pageCount = await getPdfPageCount(filePath);
+        const batchId = Date.now();
         const newPages = [];
-        
-        for (let i = 1; i <= pageCount; i++) {
-            newPages.push({
-                id: `page-insert-${Date.now()}-${i}`,
-                number: i,
-                originalNumber: i,
-                sourceFile: filePath,
-                rotation: 0,
-                thumbnail: null,
-                chapterTitle: ''
-            });
+
+        for (let fileIndex = 0; fileIndex < filePaths.length; fileIndex++) {
+            const filePath = filePaths[fileIndex];
+            const pageCount = await getPdfPageCount(filePath);
+            totalPageCount += pageCount;
+            insertedSources.push({ filePath, pageCount });
+
+            for (let pageNumber = 1; pageNumber <= pageCount; pageNumber++) {
+                newPages.push({
+                    id: `page-insert-${batchId}-${fileIndex}-${pageNumber}`,
+                    number: pageNumber,
+                    originalNumber: pageNumber,
+                    sourceFile: filePath,
+                    rotation: 0,
+                    thumbnail: null,
+                    chapterTitle: ''
+                });
+            }
         }
         
-        state.pages.splice(insertIndex, 0, ...newPages);
+        state.pages.splice(safeInsertIndex, 0, ...newPages);
         clampSplitPoints();
         state.isDirty = true;
         
@@ -1458,13 +1874,19 @@ async function insertPDFAt(insertIndex) {
         updateStatusBar();
         hideLoading();
         
-        // Generate thumbnails for visible inserted pages
-        await generateThumbnailsForPages(filePath, insertIndex, pageCount);
+        for (const source of insertedSources) {
+            await generateThumbnailsForPages(source.filePath, safeInsertIndex, source.pageCount);
+        }
         
-        showToast(`${pageCount} Seiten eingefügt`, 'success');
+        const pageLabel = totalPageCount === 1 ? 'Seite' : 'Seiten';
+        const sourceLabel = filePaths.length > 1 ? ` aus ${filePaths.length} PDFs` : '';
+        showToast(`${totalPageCount} ${pageLabel}${sourceLabel} eingefügt`, 'success');
+        return true;
         
     } catch (error) {
         showToast(error.message, 'error');
+        return false;
+    } finally {
         hideLoading();
     }
 }
@@ -1734,6 +2156,8 @@ let readerThumbLoading = new Set(); // currently loading reader thumbs
 let readerThumbLoadScheduled = false;
 let readerThumbScrollAttached = false;
 let outlineCache = {};             // Cache: { sourceFile: outline[] }
+let expandedOutlineKeys = new Set();
+let floatingOutlineOpen = false;
 let readerNavToken = 0;            // increments on each page navigation; used to ignore stale async updates
 
 function scrollReaderThumbToIndex(index, behavior = 'auto') {
@@ -1987,6 +2411,7 @@ async function loadReaderThumbnail(page, dpi) {
             maxWidth: dpi >= 72 ? 360 : 240,
             priority: 15
         });
+        if (!page.thumbnail) page.thumbnail = url;
 
         // Sidebar Thumbnail aktualisieren
         const idx = state.pages.indexOf(page);
@@ -2019,6 +2444,7 @@ async function loadReaderThumbnailBatch(sourceFile, pageNumbers, items, dpi) {
                 maxWidth: dpi >= 72 ? 360 : 240,
                 priority: 18 - itemIndex
             });
+            if (!page.thumbnail) page.thumbnail = url;
 
             const thumbWrapper = document.querySelector(`.reader-thumb[data-index="${idx}"]`);
             if (thumbWrapper) {
@@ -2072,6 +2498,8 @@ async function loadOutlineForSources(forceRefresh = false) {
 
     await Promise.all(fetches);
     renderOutlinePanel();
+    renderFloatingOutline();
+    refreshGridChapterMarkers();
 }
 
 function getCustomChapterEntries() {
@@ -2082,6 +2510,47 @@ function getCustomChapterEntries() {
             targetIndex: index
         }))
         .filter(entry => entry.title);
+}
+
+function hasCollapsibleOutlineChildren(item, depth) {
+    return depth === 0 && Array.isArray(item?.children) && item.children.length > 0;
+}
+
+function getOutlineCollapseKey(sourceFile, item, depth, index, pageNumber) {
+    const title = (item?.title || '').trim();
+    return `${sourceFile}|${depth}|${index}|${pageNumber ?? 'no-page'}|${title}`;
+}
+
+function createOutlineToggleButton(className, isCollapsed, onToggle) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = className;
+    button.classList.toggle('is-expanded', !isCollapsed);
+    button.title = isCollapsed ? 'Unterkapitel ausklappen' : 'Unterkapitel einklappen';
+    button.setAttribute('aria-label', button.title);
+    button.setAttribute('aria-expanded', String(!isCollapsed));
+    button.innerHTML = `
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <polyline points="9 18 15 12 9 6"/>
+        </svg>
+    `;
+    button.addEventListener('click', (event) => {
+        event.stopPropagation();
+        onToggle();
+    });
+    return button;
+}
+
+function toggleOutlineCollapse(key) {
+    if (expandedOutlineKeys.has(key)) {
+        expandedOutlineKeys.delete(key);
+    } else {
+        expandedOutlineKeys.add(key);
+    }
+
+    renderOutlinePanel();
+    renderViewerOutline();
+    renderFloatingOutline();
 }
 
 function renderOutlinePanel() {
@@ -2130,7 +2599,7 @@ function renderOutlinePanel() {
 }
 
 function appendCustomOutlineItems(entries, container) {
-    entries.forEach((entry) => {
+    entries.forEach((entry, index) => {
         const item = document.createElement('div');
         item.className = 'outline-item outline-item-custom';
         item.dataset.targetIndex = entry.targetIndex;
@@ -2141,7 +2610,7 @@ function appendCustomOutlineItems(entries, container) {
 
         const pageSpan = document.createElement('span');
         pageSpan.className = 'outline-page';
-        pageSpan.textContent = `S. ${entry.page}`;
+        pageSpan.textContent = formatOutlinePageRange(entry.page, getCustomChapterEndPage(entries, index));
 
         item.addEventListener('click', () => showReaderPage(entry.targetIndex));
         item.appendChild(titleSpan);
@@ -2150,11 +2619,28 @@ function appendCustomOutlineItems(entries, container) {
     });
 }
 
-function appendOutlineItems(entries, sourceFile, container, depth) {
-    entries.forEach((entry) => {
+function appendOutlineItems(entries, sourceFile, container, depth, parentBoundaryPage = null) {
+    const sourceMaxPage = getMaxOriginalPageForSource(sourceFile);
+
+    entries.forEach((entry, index) => {
         const item = document.createElement('div');
         item.className = 'outline-item';
         item.style.paddingLeft = `${12 + depth * 14}px`;
+
+        const itemPage = parseOutlinePageNumber(entry.page);
+        const canCollapse = hasCollapsibleOutlineChildren(entry, depth);
+        const collapseKey = getOutlineCollapseKey(sourceFile, entry, depth, index, itemPage);
+        const isCollapsed = canCollapse && !expandedOutlineKeys.has(collapseKey);
+        const boundaryPage = itemPage !== null
+            ? findNextOutlineBoundaryPage(entries, index, itemPage, parentBoundaryPage)
+            : parentBoundaryPage;
+        const endPage = boundaryPage !== null ? boundaryPage - 1 : sourceMaxPage;
+
+        if (canCollapse) {
+            item.appendChild(createOutlineToggleButton('outline-toggle', isCollapsed, () => {
+                toggleOutlineCollapse(collapseKey);
+            }));
+        }
 
         const titleSpan = document.createElement('span');
         titleSpan.className = 'outline-title';
@@ -2162,9 +2648,9 @@ function appendOutlineItems(entries, sourceFile, container, depth) {
 
         const pageSpan = document.createElement('span');
         pageSpan.className = 'outline-page';
-        pageSpan.textContent = entry.page ? `S. ${entry.page}` : '';
+        pageSpan.textContent = formatOutlinePageRange(itemPage, endPage);
 
-        const targetIndex = findPageIndexForOutline(sourceFile, entry.page);
+        const targetIndex = findPageIndexForOutline(sourceFile, itemPage);
         if (targetIndex === -1) {
             item.classList.add('disabled');
         } else {
@@ -2176,8 +2662,8 @@ function appendOutlineItems(entries, sourceFile, container, depth) {
         item.appendChild(pageSpan);
         container.appendChild(item);
 
-        if (entry.children && entry.children.length > 0) {
-            appendOutlineItems(entry.children, sourceFile, container, depth + 1);
+        if (entry.children && entry.children.length > 0 && !isCollapsed) {
+            appendOutlineItems(entry.children, sourceFile, container, depth + 1, boundaryPage);
         }
     });
 }
@@ -2194,6 +2680,193 @@ function highlightOutlineForPage(pageIndex) {
 
     if (activeItem) {
         activeItem.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+}
+
+function createFloatingOutlineLabel(title, rangeText) {
+    const label = document.createElement('span');
+    label.className = 'floating-outline-text';
+
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'floating-outline-title';
+    titleSpan.textContent = title || 'Ohne Titel';
+    label.appendChild(titleSpan);
+
+    if (rangeText) {
+        const rangeSpan = document.createElement('span');
+        rangeSpan.className = 'floating-outline-range';
+        rangeSpan.textContent = rangeText;
+        label.appendChild(rangeSpan);
+    }
+
+    return label;
+}
+
+function renderFloatingOutline() {
+    const body = document.getElementById('floating-outline-body');
+    if (!body) return;
+
+    body.innerHTML = '';
+    const placeholder = document.createElement('div');
+    placeholder.className = 'floating-outline-empty';
+    placeholder.textContent = 'Kein Inhaltsverzeichnis gefunden';
+
+    const files = Array.from(new Set(state.pages.map(p => p.sourceFile)));
+    const multipleSources = files.length > 1;
+    let hasEntries = false;
+
+    const customChapters = getCustomChapterEntries();
+    if (customChapters.length > 0) {
+        hasEntries = true;
+        const sourceLabel = document.createElement('div');
+        sourceLabel.className = 'floating-outline-source';
+        sourceLabel.textContent = 'Eigene Kapitel';
+        body.appendChild(sourceLabel);
+        appendFloatingCustomOutlineItems(customChapters, body);
+    }
+
+    files.forEach((filePath) => {
+        const outline = outlineCache[filePath];
+        if (!outline || outline.length === 0) return;
+        hasEntries = true;
+
+        if (multipleSources) {
+            const sourceLabel = document.createElement('div');
+            sourceLabel.className = 'floating-outline-source';
+            sourceLabel.textContent = getBaseName(filePath);
+            body.appendChild(sourceLabel);
+        }
+
+        appendFloatingOutlineItems(outline, filePath, body, 0);
+    });
+
+    if (!hasEntries) {
+        body.appendChild(placeholder);
+    }
+}
+
+function appendFloatingCustomOutlineItems(entries, container) {
+    entries.forEach((entry, index) => {
+        const item = document.createElement('div');
+        item.className = 'floating-outline-item floating-outline-item-custom';
+        item.dataset.depth = 0;
+        item.dataset.targetIndex = entry.targetIndex;
+
+        const label = createFloatingOutlineLabel(
+            entry.title,
+            formatOutlinePageRange(entry.page, getCustomChapterEndPage(entries, index))
+        );
+
+        const actions = document.createElement('div');
+        actions.className = 'floating-outline-actions';
+
+        const extractBtn = document.createElement('button');
+        extractBtn.className = 'floating-outline-action';
+        extractBtn.title = 'Kapitel extrahieren';
+        extractBtn.textContent = 'Ex';
+        extractBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            extractCustomChapter(entry, entries[index + 1]);
+        });
+        actions.appendChild(extractBtn);
+
+        item.appendChild(label);
+        item.appendChild(actions);
+        item.addEventListener('click', () => focusGridPage(entry.targetIndex));
+        container.appendChild(item);
+    });
+}
+
+function appendFloatingOutlineItems(items, sourceFile, container, depth, parentBoundaryPage = null) {
+    const sourceMaxPage = getMaxOriginalPageForSource(sourceFile);
+
+    items.forEach((entry, index) => {
+        const item = document.createElement('div');
+        item.className = 'floating-outline-item';
+        item.dataset.depth = depth;
+
+        const itemPage = parseOutlinePageNumber(entry.page);
+        const canCollapse = hasCollapsibleOutlineChildren(entry, depth);
+        const collapseKey = getOutlineCollapseKey(sourceFile, entry, depth, index, itemPage);
+        const isCollapsed = canCollapse && !expandedOutlineKeys.has(collapseKey);
+        const boundaryPage = itemPage !== null
+            ? findNextOutlineBoundaryPage(items, index, itemPage, parentBoundaryPage)
+            : parentBoundaryPage;
+        const endPage = boundaryPage !== null ? boundaryPage - 1 : sourceMaxPage;
+
+        if (canCollapse) {
+            item.appendChild(createOutlineToggleButton('floating-outline-toggle', isCollapsed, () => {
+                toggleOutlineCollapse(collapseKey);
+            }));
+        }
+
+        const label = createFloatingOutlineLabel(
+            entry.title || 'Ohne Titel',
+            formatOutlinePageRange(itemPage, endPage)
+        );
+
+        const actions = document.createElement('div');
+        actions.className = 'floating-outline-actions';
+
+        const extractBtn = document.createElement('button');
+        extractBtn.className = 'floating-outline-action';
+        extractBtn.title = 'Kapitel extrahieren';
+        extractBtn.textContent = 'Ex';
+        extractBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            extractOutlineChapter(sourceFile, itemPage, endPage, entry.title);
+        });
+        actions.appendChild(extractBtn);
+
+        item.appendChild(label);
+        item.appendChild(actions);
+
+        const targetIndex = findPageIndexForOutline(sourceFile, itemPage);
+        if (targetIndex === -1) {
+            item.classList.add('disabled');
+        } else {
+            item.addEventListener('click', () => focusGridPage(targetIndex));
+        }
+
+        container.appendChild(item);
+
+        if (entry.children && entry.children.length > 0 && !isCollapsed) {
+            appendFloatingOutlineItems(entry.children, sourceFile, container, depth + 1, boundaryPage);
+        }
+    });
+}
+
+async function showFloatingOutlinePanel(forceRefresh = false) {
+    const panel = document.getElementById('floating-outline-panel');
+    const button = document.getElementById('btn-floating-outline');
+    if (!panel || state.pages.length === 0) return;
+
+    floatingOutlineOpen = true;
+    panel.classList.add('visible');
+    panel.setAttribute('aria-hidden', 'false');
+    button?.classList.add('active');
+    renderFloatingOutline();
+
+    await loadOutlineForSources(forceRefresh);
+    if (floatingOutlineOpen) {
+        renderFloatingOutline();
+    }
+}
+
+function hideFloatingOutlinePanel() {
+    const panel = document.getElementById('floating-outline-panel');
+    const button = document.getElementById('btn-floating-outline');
+    floatingOutlineOpen = false;
+    panel?.classList.remove('visible');
+    panel?.setAttribute('aria-hidden', 'true');
+    button?.classList.remove('active');
+}
+
+function toggleFloatingOutlinePanel() {
+    if (floatingOutlineOpen) {
+        hideFloatingOutlinePanel();
+    } else {
+        showFloatingOutlinePanel();
     }
 }
 
@@ -2737,6 +3410,25 @@ function renderViewerOutline() {
     }
 }
 
+function createViewerOutlineLabel(title, rangeText) {
+    const label = document.createElement('span');
+    label.className = 'viewer-outline-text';
+
+    const titleSpan = document.createElement('span');
+    titleSpan.className = 'viewer-outline-title';
+    titleSpan.textContent = title || 'Ohne Titel';
+    label.appendChild(titleSpan);
+
+    if (rangeText) {
+        const rangeSpan = document.createElement('span');
+        rangeSpan.className = 'viewer-outline-range';
+        rangeSpan.textContent = rangeText;
+        label.appendChild(rangeSpan);
+    }
+
+    return label;
+}
+
 function appendViewerCustomOutlineItems(entries, container) {
     entries.forEach((entry, index) => {
         const el = document.createElement('div');
@@ -2744,9 +3436,10 @@ function appendViewerCustomOutlineItems(entries, container) {
         el.dataset.depth = 0;
         el.dataset.targetIndex = entry.targetIndex;
 
-        const label = document.createElement('span');
-        label.className = 'viewer-outline-text';
-        label.textContent = entry.title;
+        const label = createViewerOutlineLabel(
+            entry.title,
+            formatOutlinePageRange(entry.page, getCustomChapterEndPage(entries, index))
+        );
 
         const actions = document.createElement('div');
         actions.className = 'viewer-outline-actions';
@@ -2801,6 +3494,30 @@ function parseOutlinePageNumber(pageNumber) {
     return Number.isNaN(parsed) ? null : parsed;
 }
 
+function formatOutlinePageRange(startPage, endPage) {
+    const start = parseOutlinePageNumber(startPage);
+    if (start === null) return '';
+
+    const end = parseOutlinePageNumber(endPage);
+    if (end === null || end <= start) return `S. ${start}`;
+    return `S. ${start}-${end}`;
+}
+
+function getCustomChapterEndPage(entries, index) {
+    const nextEntry = entries[index + 1];
+    return nextEntry ? nextEntry.page - 1 : state.pages.length;
+}
+
+function getMaxOriginalPageForSource(sourceFile) {
+    const pageNumbers = state.pages
+        .filter(page => page.sourceFile === sourceFile)
+        .map(page => parseOutlinePageNumber(page.originalNumber))
+        .filter(pageNumber => pageNumber !== null);
+
+    if (pageNumbers.length === 0) return null;
+    return Math.max(...pageNumbers);
+}
+
 function findNextOutlineBoundaryPage(items, currentIndex, startPage, fallbackBoundaryPage) {
     for (let i = currentIndex + 1; i < items.length; i++) {
         const siblingPage = parseOutlinePageNumber(items[i]?.page);
@@ -2808,24 +3525,36 @@ function findNextOutlineBoundaryPage(items, currentIndex, startPage, fallbackBou
             return siblingPage;
         }
     }
-    return fallbackBoundaryPage || null;
+    return fallbackBoundaryPage ?? null;
 }
 
 function appendViewerOutlineItems(items, sourceFile, container, depth, parentBoundaryPage = null) {
+    const sourceMaxPage = getMaxOriginalPageForSource(sourceFile);
+
     items.forEach((item, index) => {
         const el = document.createElement('div');
         el.className = 'viewer-outline-item';
         el.dataset.depth = depth;
 
         const itemPage = parseOutlinePageNumber(item.page);
+        const canCollapse = hasCollapsibleOutlineChildren(item, depth);
+        const collapseKey = getOutlineCollapseKey(sourceFile, item, depth, index, itemPage);
+        const isCollapsed = canCollapse && !expandedOutlineKeys.has(collapseKey);
         const boundaryPage = itemPage !== null
             ? findNextOutlineBoundaryPage(items, index, itemPage, parentBoundaryPage)
             : parentBoundaryPage;
-        const endPage = boundaryPage !== null ? boundaryPage - 1 : null;
+        const endPage = boundaryPage !== null ? boundaryPage - 1 : sourceMaxPage;
 
-        const label = document.createElement('span');
-        label.className = 'viewer-outline-text';
-        label.textContent = item.title || 'Ohne Titel';
+        if (canCollapse) {
+            el.appendChild(createOutlineToggleButton('viewer-outline-toggle', isCollapsed, () => {
+                toggleOutlineCollapse(collapseKey);
+            }));
+        }
+
+        const label = createViewerOutlineLabel(
+            item.title || 'Ohne Titel',
+            formatOutlinePageRange(itemPage, endPage)
+        );
 
         const actions = document.createElement('div');
         actions.className = 'viewer-outline-actions';
@@ -2854,7 +3583,7 @@ function appendViewerOutlineItems(items, sourceFile, container, depth, parentBou
 
         container.appendChild(el);
 
-        if (item.children && item.children.length > 0) {
+        if (item.children && item.children.length > 0 && !isCollapsed) {
             appendViewerOutlineItems(item.children, sourceFile, container, depth + 1, boundaryPage);
         }
     });
@@ -3088,6 +3817,7 @@ document.addEventListener('keydown', (e) => {
         state.selectedPages.clear();
         updatePageSelectionUI();
         updateSelectionBar();
+        hideFloatingOutlinePanel();
         hideModal();
     }
     
@@ -3150,6 +3880,8 @@ function setupUnsavedModal() {
 
 document.addEventListener('DOMContentLoaded', () => {
     setupUploadZone();
+    setupPageGridDelegatedEvents();
+    setupEditorFileDropZone();
     setupUnsavedModal();
     
     // Ensure page viewer lives at body level (avoids stacking context issues)
@@ -3160,6 +3892,9 @@ document.addEventListener('DOMContentLoaded', () => {
     
     // Fullscreen button - opens viewer with first selected page
     const btnFullscreen = document.getElementById('btn-fullscreen-view');
+    const btnFloatingOutline = document.getElementById('btn-floating-outline');
+    const btnFloatingOutlineRefresh = document.getElementById('btn-floating-outline-refresh');
+    const btnFloatingOutlineClose = document.getElementById('btn-floating-outline-close');
     
     if (btnFullscreen) {
         btnFullscreen.addEventListener('click', (e) => {
@@ -3177,4 +3912,24 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
     }
+
+    btnFloatingOutline?.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        toggleFloatingOutlinePanel();
+    });
+
+    btnFloatingOutlineRefresh?.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        showFloatingOutlinePanel(true);
+    });
+
+    btnFloatingOutlineClose?.addEventListener('click', (e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        hideFloatingOutlinePanel();
+    });
+
+    updateFloatingButtons();
 });

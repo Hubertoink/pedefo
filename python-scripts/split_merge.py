@@ -6,6 +6,7 @@ Funktionen zum Aufteilen und Zusammenführen von PDF-Dateien
 import sys
 import json
 import os
+import copy
 
 try:
     from PyPDF2 import PdfMerger, PdfReader, PdfWriter
@@ -239,6 +240,7 @@ def build_pdf(operations_json, output):
         
         writer = PdfWriter()
         total_pages = 0
+        reader_cache = {}
         
         for op in operations:
             source_file = op['sourceFile']
@@ -256,7 +258,10 @@ def build_pdf(operations_json, output):
                 total_pages += end_idx - start_idx
                 continue
 
-            reader = PdfReader(source_file)
+            reader = reader_cache.get(source_file)
+            if reader is None:
+                reader = PdfReader(source_file)
+                reader_cache[source_file] = reader
             
             for page_info in pages:
                 page_num = page_info['originalNumber'] - 1  # 0-basiert
@@ -266,6 +271,7 @@ def build_pdf(operations_json, output):
                     page = reader.pages[page_num]
                     
                     if rotation != 0:
+                        page = copy.copy(page)
                         page.rotate(rotation)
                     
                     writer.add_page(page)

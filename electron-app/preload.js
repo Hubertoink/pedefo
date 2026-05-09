@@ -12,6 +12,7 @@ contextBridge.exposeInMainWorld('pedefo', {
     openFiles: () => ipcRenderer.invoke('dialog:openFiles'),
     openFile: () => ipcRenderer.invoke('dialog:openFile'),
     saveFile: (defaultName) => ipcRenderer.invoke('dialog:saveFile', defaultName),
+    saveZipFile: (defaultName) => ipcRenderer.invoke('dialog:saveZipFile', defaultName),
     
     // PDF Operationen
     pdf: {
@@ -38,6 +39,10 @@ contextBridge.exposeInMainWorld('pedefo', {
         generateBatchThumbnails: (filePath, pageNumbers, dpi) => ipcRenderer.invoke('pdf:generateBatchThumbnails', filePath, pageNumbers, dpi),
         buildPDF: (operations, outputPath) => ipcRenderer.invoke('pdf:buildPDF', operations, outputPath)
     },
+
+    archive: {
+        createZip: (entries, outputPath) => ipcRenderer.invoke('archive:createZip', entries, outputPath)
+    },
     
     // System
     system: {
@@ -49,6 +54,8 @@ contextBridge.exposeInMainWorld('pedefo', {
     file: {
         exists: (filePath) => ipcRenderer.invoke('file:exists', filePath),
         getSize: (filePath) => ipcRenderer.invoke('file:getSize', filePath),
+        createTempDir: (prefix) => ipcRenderer.invoke('file:createTempDir', prefix),
+        removeTempPath: (filePath) => ipcRenderer.invoke('file:removeTempPath', filePath),
         readBinary: (filePath) => ipcRenderer.invoke('file:readBinary', filePath),
         openPath: (filePath) => ipcRenderer.invoke('file:openPath', filePath)
     }
