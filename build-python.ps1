@@ -52,7 +52,8 @@ $scripts = @(
     "split_merge.py",
     "compress.py",
     "thumbnails.py",
-    "utils.py"
+    "utils.py",
+    "ocr.py"
 )
 
 # Create build directory
@@ -75,6 +76,8 @@ foreach ($script in $scripts) {
         --hidden-import=Crypto `
         --hidden-import=Crypto.Cipher `
         --hidden-import=Crypto.Cipher.AES `
+        --hidden-import=PIL `
+        --hidden-import=pytesseract `
         --clean `
         --noconfirm `
         "python-scripts\$script"

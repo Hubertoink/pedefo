@@ -30,6 +30,14 @@ contextBridge.exposeInMainWorld('pedefo', {
             ipcRenderer.on('pdf:compress-progress', listener);
             return () => ipcRenderer.removeListener('pdf:compress-progress', listener);
         },
+        checkOCR: (language) => ipcRenderer.invoke('pdf:checkOcr', language),
+        ocr: (inputFile, outputPath, language, operationId) =>
+            ipcRenderer.invoke('pdf:ocr', inputFile, outputPath, language, operationId),
+        onOcrProgress: (callback) => {
+            const listener = (_event, payload) => callback(payload);
+            ipcRenderer.on('pdf:ocr-progress', listener);
+            return () => ipcRenderer.removeListener('pdf:ocr-progress', listener);
+        },
         getInfo: (filePath) => ipcRenderer.invoke('pdf:getInfo', filePath),
         getOutline: (filePath) => ipcRenderer.invoke('pdf:getOutline', filePath),
         getPageCount: (filePath) => ipcRenderer.invoke('pdf:getPageCount', filePath),

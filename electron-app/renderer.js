@@ -12,7 +12,15 @@ const state = {
     thumbnailsGenerating: false,  // Lock to prevent parallel thumbnail generation
     splitPoints: [],             // page indices where a split starts (between pages)
     lastFocusedPageId: null,     // used to prioritize loading around user focus
-    editingChapterPageId: null
+    editingChapterPageId: null,
+    ocr: {
+        sourceFile: null,
+        checked: false,
+        recommended: false,
+        textChars: 0,
+        sampledPages: 0,
+        running: false
+    }
 };
 
 // Performance helpers
@@ -113,6 +121,87 @@ async function getPdfPageCount(filePath) {
     }
 }
 
+function resetOcrState(sourceFile = null) {
+    state.ocr = {
+        sourceFile,
+        checked: false,
+        recommended: false,
+        textChars: 0,
+        sampledPages: 0,
+        running: false
+    };
+    updateOcrControls();
+}
+
+function updateOcrControls() {
+    const buttons = [
+        document.getElementById('btn-ocr'),
+        document.getElementById('btn-viewer-ocr')
+    ].filter(Boolean);
+
+    const show = state.pages.length > 0 && state.ocr.checked && state.ocr.recommended;
+    buttons.forEach((button) => {
+        button.style.display = show ? 'flex' : 'none';
+        button.disabled = !!state.ocr.running;
+        button.title = state.ocr.running
+            ? 'OCR läuft bereits'
+            : 'OCR ausführen und durchsuchbare PDF erstellen';
+    });
+}
+
+async function samplePdfTextStats(filePath, maxPages = 5) {
+    const documentProxy = await getPdfDocument(filePath);
+    const sampledPages = Math.min(documentProxy.numPages, maxPages);
+    let textChars = 0;
+    let textItems = 0;
+
+    for (let pageNumber = 1; pageNumber <= sampledPages; pageNumber++) {
+        const pdfPage = await documentProxy.getPage(pageNumber);
+        const textContent = await pdfPage.getTextContent();
+        const items = Array.isArray(textContent.items) ? textContent.items : [];
+        textItems += items.length;
+        for (const item of items) {
+            const text = typeof item.str === 'string' ? item.str.replace(/\s+/g, '') : '';
+            textChars += text.length;
+        }
+    }
+
+    return { sampledPages, textChars, textItems };
+}
+
+async function detectOcrNeed(filePath, loadToken) {
+    try {
+        const stats = await samplePdfTextStats(filePath);
+        if (loadToken !== pdfRender.loadToken || state.currentFile !== filePath) return;
+
+        const threshold = Math.max(60, stats.sampledPages * 30);
+        state.ocr = {
+            sourceFile: filePath,
+            checked: true,
+            recommended: stats.textChars < threshold,
+            textChars: stats.textChars,
+            sampledPages: stats.sampledPages,
+            running: false
+        };
+        updateOcrControls();
+
+        if (state.ocr.recommended) {
+            showToast('Scan erkannt: OCR kann auswählbaren Text erzeugen', 'info');
+        }
+    } catch (_) {
+        if (loadToken !== pdfRender.loadToken || state.currentFile !== filePath) return;
+        state.ocr = {
+            sourceFile: filePath,
+            checked: true,
+            recommended: false,
+            textChars: 0,
+            sampledPages: 0,
+            running: false
+        };
+        updateOcrControls();
+    }
+}
+
 function getTextLayerImageId(target) {
     return target === 'viewer' ? 'viewer-page-image' : 'reader-page-image';
 }
@@ -135,7 +224,7 @@ function ensureSelectableTextLayer(target) {
     const img = document.getElementById(getTextLayerImageId(target));
     if (!img) return null;
 
-    const host = img.closest('.reader-image-container, .page-viewer-content') || img.parentElement;
+    const host = img.closest('.reader-image-container, .page-viewer-page-frame, .page-viewer-content') || img.parentElement;
     if (!host) return null;
 
     let layer = document.getElementById(getTextLayerId(target));
@@ -178,10 +267,17 @@ function positionSelectableTextLayer(layer, host, img) {
     }
 
     layer.style.display = 'block';
-    layer.style.left = `${imgRect.left - hostRect.left}px`;
-    layer.style.top = `${imgRect.top - hostRect.top}px`;
-    layer.style.width = `${imgRect.width}px`;
-    layer.style.height = `${imgRect.height}px`;
+    if (host.classList.contains('page-viewer-page-frame')) {
+        layer.style.left = '0px';
+        layer.style.top = '0px';
+        layer.style.width = `${hostRect.width}px`;
+        layer.style.height = `${hostRect.height}px`;
+    } else {
+        layer.style.left = `${imgRect.left - hostRect.left + (host.scrollLeft || 0)}px`;
+        layer.style.top = `${imgRect.top - hostRect.top + (host.scrollTop || 0)}px`;
+        layer.style.width = `${imgRect.width}px`;
+        layer.style.height = `${imgRect.height}px`;
+    }
     return { width: imgRect.width, height: imgRect.height };
 }
 
@@ -488,6 +584,10 @@ function hideModal() {
     document.getElementById('modal-overlay').style.display = 'none';
 }
 
+function isModalOpen() {
+    return document.getElementById('modal-overlay').style.display === 'flex';
+}
+
 // Modal event listeners
 document.querySelectorAll('.modal-close, [data-modal-cancel]').forEach(btn => {
     btn.addEventListener('click', hideModal);
@@ -593,6 +693,7 @@ async function loadPDF(filePath) {
         state.pages = [];
         state.selectedPages.clear();
         state.isDirty = false;
+        resetOcrState(filePath);
         outlineCache = {};
         expandedOutlineKeys.clear();
         hideFloatingOutlinePanel();
@@ -624,6 +725,7 @@ async function loadPDF(filePath) {
         generateThumbnailsWithPoppler(filePath);
 
         loadOutlineForSources().catch(() => {});
+        detectOcrNeed(filePath, loadToken).catch(() => {});
         
         showToast(`${pageCount} Seiten geladen`, 'success');
         
@@ -2288,31 +2390,155 @@ async function compressPDF() {
     }
 }
 
+function getDirectCurrentSourceFile() {
+    if (state.pages.length === 0 || state.isDirty || chaptersForPages(state.pages).length > 0) {
+        return null;
+    }
+
+    const sourceFile = state.pages[0].sourceFile;
+    const isUnmodifiedSingleSource = state.pages.every(page => (
+        page.sourceFile === sourceFile &&
+        page.rotation === 0
+    ));
+
+    return isUnmodifiedSingleSource ? sourceFile : null;
+}
+
+function joinTempPath(dir, fileName) {
+    const separator = dir.includes('\\') ? '\\' : '/';
+    return `${dir}${separator}${fileName}`;
+}
+
+function formatOcrError(result) {
+    const missingLanguages = result?.data?.missing_languages;
+    if (Array.isArray(missingLanguages) && missingLanguages.length > 0) {
+        return `OCR-Sprachdaten fehlen: ${missingLanguages.join(', ')}. Für deutsche Umlaute bitte Tesseract mit Deutsch-Sprachdaten installieren.`;
+    }
+
+    const missing = result?.data?.missing;
+    if (Array.isArray(missing) && missing.length > 0) {
+        return `OCR nicht verfügbar: ${missing.join(', ')} fehlt.`;
+    }
+    return result?.message || 'OCR konnte nicht gestartet werden';
+}
+
+async function runOCRForCurrentPDF() {
+    if (!state.currentFile || state.pages.length === 0) {
+        showToast('Keine PDF für OCR geladen', 'error');
+        return;
+    }
+
+    const defaultName = `${getFileBaseName(state.currentFile)}-ocr.pdf`;
+    const outputPath = await window.pedefo.saveFile(defaultName);
+    if (!outputPath) return;
+
+    const operationId = `ocr-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+    let stopProgressListener = null;
+    let tempDir = null;
+    let loadOutput = false;
+
+    showLoading('OCR wird ausgeführt...', {
+        progress: true,
+        percent: 2,
+        detail: 'OCR-Verfügbarkeit wird geprüft...'
+    });
+
+    if (window.pedefo.pdf.onOcrProgress) {
+        stopProgressListener = window.pedefo.pdf.onOcrProgress((progress) => {
+            if (progress?.operationId && progress.operationId !== operationId) return;
+            setLoadingProgress(progress.percent, progress.message || 'OCR läuft...');
+        });
+    }
+
+    try {
+        state.ocr.running = true;
+        updateOcrControls();
+
+        const availability = await window.pedefo.pdf.checkOCR('deu');
+        if (!availability.success) {
+            throw new Error(formatOcrError(availability));
+        }
+
+        let sourceFile = getDirectCurrentSourceFile();
+        if (!sourceFile) {
+            setLoadingProgress(6, 'Aktuelle Änderungen werden für OCR vorbereitet...');
+            tempDir = await window.pedefo.file.createTempDir('pedefo-ocr');
+            sourceFile = joinTempPath(tempDir, 'ocr-source.pdf');
+            const buildResult = await buildPdfForPages(state.pages, sourceFile);
+            if (!buildResult.success) {
+                throw new Error(buildResult.message || 'Temporäre PDF konnte nicht erstellt werden');
+            }
+        }
+
+        setLoadingProgress(10, 'OCR startet...');
+        const result = await window.pedefo.pdf.ocr(sourceFile, outputPath, 'deu', operationId);
+        if (!result.success) {
+            throw new Error(result.message || 'OCR fehlgeschlagen');
+        }
+
+        loadOutput = true;
+        showToast('OCR-PDF erstellt und geladen', 'success');
+    } catch (error) {
+        showToast(error.message, 'error');
+    } finally {
+        if (typeof stopProgressListener === 'function') {
+            stopProgressListener();
+        }
+        if (tempDir) {
+            await window.pedefo.file.removeTempPath(tempDir);
+        }
+        state.ocr.running = false;
+        updateOcrControls();
+        hideLoading();
+    }
+
+    if (loadOutput) {
+        if (document.getElementById('page-viewer').style.display === 'flex') {
+            closePageViewer();
+        }
+        await loadPDF(outputPath);
+    }
+}
+
 // ============================================
 // New File
 // ============================================
 
-function newFile() {
-    if (state.isDirty) {
-        if (!confirm('Änderungen verwerfen und neue Datei öffnen?')) {
-            return;
-        }
-    }
-    
+function resetCurrentDocument() {
     // Close page viewer if open
     if (document.getElementById('page-viewer').style.display === 'flex') {
         closePageViewer();
     }
+    hideFloatingOutlinePanel();
     
     state.currentFile = null;
     state.pages = [];
     state.selectedPages.clear();
+    state.splitPoints = [];
+    state.lastFocusedPageId = null;
+    state.editingChapterPageId = null;
     state.isDirty = false;
+    resetOcrState();
+    pageIndexById = new Map();
     
     document.getElementById('current-file-name').textContent = '';
     document.getElementById('pages-container').innerHTML = '';
     
     showScreen('screen-upload');
+}
+
+function newFile() {
+    if (state.isDirty) {
+        showModal('new-file');
+        return;
+    }
+
+    resetCurrentDocument();
+}
+
+function confirmNewFileDiscard() {
+    hideModal();
+    resetCurrentDocument();
 }
 
 // ============================================
@@ -3275,10 +3501,80 @@ async function loadPriorityThumbnails(centerIndex, token) {
 let viewerCurrentPage = 0;
 let viewerHighResThumbnails = {};  // Cache: { sourceFile: { originalNumber: data } }
 let viewerOutlineCache = {};
+let viewerZoom = 1;
+const VIEWER_ZOOM_MIN = 0.5;
+const VIEWER_ZOOM_MAX = 3;
+const VIEWER_ZOOM_STEP = 0.25;
+
+function clampViewerZoom(value) {
+    return Math.max(VIEWER_ZOOM_MIN, Math.min(VIEWER_ZOOM_MAX, value));
+}
+
+function updateViewerZoomControls() {
+    const label = document.getElementById('viewer-zoom-level');
+    const zoomIn = document.getElementById('btn-viewer-zoom-in');
+    const zoomOut = document.getElementById('btn-viewer-zoom-out');
+    const zoomReset = document.getElementById('btn-viewer-zoom-reset');
+
+    if (label) label.textContent = `${Math.round(viewerZoom * 100)}%`;
+    if (zoomIn) zoomIn.disabled = viewerZoom >= VIEWER_ZOOM_MAX;
+    if (zoomOut) zoomOut.disabled = viewerZoom <= VIEWER_ZOOM_MIN;
+    if (zoomReset) zoomReset.classList.toggle('active', viewerZoom !== 1);
+}
+
+function applyViewerZoom(renderTextLayer = true) {
+    const img = document.getElementById('viewer-page-image');
+    const content = document.querySelector('.page-viewer-content');
+    if (!img) return;
+
+    img.style.maxWidth = `${viewerZoom * 100}%`;
+    img.style.maxHeight = `${viewerZoom * 100}%`;
+    if (content) {
+        content.classList.toggle('is-zoomed', viewerZoom > 1);
+    }
+    updateViewerZoomControls();
+
+    if (renderTextLayer) {
+        requestAnimationFrame(() => {
+            renderSelectableTextLayer('viewer', getCurrentViewerPage());
+        });
+    }
+}
+
+function setViewerZoom(nextZoom, options = {}) {
+    const content = document.querySelector('.page-viewer-content');
+    const previousScrollWidth = content?.scrollWidth || 0;
+    const previousScrollHeight = content?.scrollHeight || 0;
+    const centerX = content && previousScrollWidth > 0
+        ? (content.scrollLeft + content.clientWidth / 2) / previousScrollWidth
+        : 0.5;
+    const centerY = content && previousScrollHeight > 0
+        ? (content.scrollTop + content.clientHeight / 2) / previousScrollHeight
+        : 0.5;
+
+    viewerZoom = clampViewerZoom(nextZoom);
+    applyViewerZoom(options.renderTextLayer !== false);
+
+    if (content && options.preserveCenter) {
+        requestAnimationFrame(() => {
+            content.scrollLeft = Math.max(0, content.scrollWidth * centerX - content.clientWidth / 2);
+            content.scrollTop = Math.max(0, content.scrollHeight * centerY - content.clientHeight / 2);
+        });
+    }
+}
+
+function zoomViewerBy(delta) {
+    setViewerZoom(viewerZoom + delta, { preserveCenter: true });
+}
+
+function resetViewerZoom() {
+    setViewerZoom(1, { preserveCenter: true });
+}
 
 async function openPageViewer(startIndex = 0) {
     viewerCurrentPage = startIndex;
     viewerHighResThumbnails = {};  // Reset cache
+    viewerZoom = 1;
     
     // Get the modal element
     const modal = document.getElementById('page-viewer');
@@ -3327,12 +3623,13 @@ function showViewerPage(index) {
     
     if (thumbnail) {
         img.src = thumbnail;
-        img.style.transform = `rotate(${page.rotation}deg)`;
         img.style.display = 'block';
     } else {
         img.src = '';
         img.style.display = 'block';
     }
+    img.style.transform = `rotate(${page.rotation}deg)`;
+    applyViewerZoom(false);
     renderSelectableTextLayer('viewer', page);
     
     // Update page info
@@ -3451,6 +3748,8 @@ function updateViewerActions() {
     if (deleteBtn) {
         deleteBtn.disabled = state.pages.length <= 1;
     }
+
+    updateOcrControls();
 }
 
 function openViewerChapterModal() {
@@ -3843,18 +4142,38 @@ document.getElementById('btn-viewer-outline-refresh').addEventListener('click', 
     loadViewerOutline(true);
 });
 document.getElementById('btn-viewer-chapter').addEventListener('click', openViewerChapterModal);
+document.getElementById('btn-viewer-zoom-in').addEventListener('click', () => zoomViewerBy(VIEWER_ZOOM_STEP));
+document.getElementById('btn-viewer-zoom-out').addEventListener('click', () => zoomViewerBy(-VIEWER_ZOOM_STEP));
+document.getElementById('btn-viewer-zoom-reset').addEventListener('click', resetViewerZoom);
 document.getElementById('btn-viewer-rotate-left').addEventListener('click', () => rotateViewerPage(-90));
 document.getElementById('btn-viewer-rotate-right').addEventListener('click', () => rotateViewerPage(90));
 document.getElementById('btn-viewer-extract').addEventListener('click', extractViewerPage);
 document.getElementById('btn-viewer-duplicate').addEventListener('click', duplicateViewerPage);
 document.getElementById('btn-viewer-delete').addEventListener('click', deleteViewerPage);
 
+document.querySelector('.page-viewer-content').addEventListener('wheel', (e) => {
+    if (document.getElementById('page-viewer').style.display !== 'flex') return;
+    if (!e.ctrlKey) return;
+    e.preventDefault();
+    zoomViewerBy(e.deltaY < 0 ? VIEWER_ZOOM_STEP : -VIEWER_ZOOM_STEP);
+}, { passive: false });
+
 // Keyboard Navigation
 document.addEventListener('keydown', (e) => {
     if (document.getElementById('page-viewer').style.display !== 'flex') return;
+    if (isModalOpen()) return;
     
     if (e.key === 'Escape') {
         closePageViewer();
+    } else if (e.key === '+' || e.key === '=') {
+        e.preventDefault();
+        zoomViewerBy(VIEWER_ZOOM_STEP);
+    } else if (e.key === '-' || e.key === '_') {
+        e.preventDefault();
+        zoomViewerBy(-VIEWER_ZOOM_STEP);
+    } else if (e.key === '0') {
+        e.preventDefault();
+        resetViewerZoom();
     } else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') {
         e.preventDefault();
         showViewerPage(viewerCurrentPage - 1);
@@ -3968,9 +4287,12 @@ document.getElementById('chapter-title').addEventListener('keydown', (e) => {
 
 document.getElementById('btn-compress').addEventListener('click', openCompressModal);
 document.getElementById('btn-compress-confirm').addEventListener('click', compressPDF);
+document.getElementById('btn-ocr').addEventListener('click', runOCRForCurrentPDF);
+document.getElementById('btn-viewer-ocr').addEventListener('click', runOCRForCurrentPDF);
 
 document.getElementById('btn-save').addEventListener('click', savePDF);
 document.getElementById('btn-new').addEventListener('click', newFile);
+document.getElementById('btn-new-file-discard').addEventListener('click', confirmNewFileDiscard);
 
 // ============================================
 // Keyboard Shortcuts

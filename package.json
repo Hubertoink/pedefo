@@ -44,6 +44,11 @@
         "filter": ["**/*.exe"]
       },
       {
+        "from": "tessdata",
+        "to": "tessdata",
+        "filter": ["**/*"]
+      },
+      {
         "from": "electron-app/poppler",
         "to": "poppler"
       }
@@ -51,10 +56,7 @@
     "win": {
       "artifactName": "${productName}-Setup-${version}.${ext}",
       "target": [
-        {
-          "target": "nsis",
-          "arch": ["x64"]
-        }
+        "nsis"
       ],
       "icon": "assets/PedefO_Icon.ico"
     },

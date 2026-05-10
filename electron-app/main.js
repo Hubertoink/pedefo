@@ -555,6 +555,36 @@ ipcMain.handle('pdf:compress', async (event, inputFile, outputPath, quality, ope
     }
 });
 
+ipcMain.handle('pdf:checkOcr', async (event, language) => {
+    try {
+        const result = await runPython('ocr.py', ['check', language || 'deu']);
+        return result;
+    } catch (error) {
+        return { success: false, message: error.message };
+    }
+});
+
+ipcMain.handle('pdf:ocr', async (event, inputFile, outputPath, language, operationId) => {
+    try {
+        const args = ['ocr', inputFile, outputPath, language || 'deu', '200'];
+        const result = await runPython('ocr.py', args, {
+            onProgress: (progress) => {
+                event.sender.send('pdf:ocr-progress', {
+                    operationId,
+                    percent: progress.percent,
+                    message: progress.message,
+                    stage: progress.stage,
+                    current: progress.current,
+                    total: progress.total
+                });
+            }
+        });
+        return result;
+    } catch (error) {
+        return { success: false, message: error.message };
+    }
+});
+
 ipcMain.handle('pdf:getInfo', async (event, filePath) => {
     try {
         const args = ['info', filePath];

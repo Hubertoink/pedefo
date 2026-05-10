@@ -15,6 +15,7 @@ Pedefo ist eine lokale Electron-App zum schnellen Bearbeiten, Lesen und Extrahie
 - 📤 **Kapitel/Seiten exportieren**: Kapitel-Export über Outline-Icon (verwendet berechnete Seitenbereiche), Auswahl-Export, Bereichs-Export
 - 🗜 **Komprimieren**: Ghostscript (optional) für bessere Reduktion, PyPDF2 als Fallback
 - 🖼 **Thumbnails**: Poppler-generiert, lazy loading; High-Res für Reader/Vollbild
+- 🔎 **OCR für Scans**: Gescannte PDFs werden per Textprobe erkannt; OCR läuft nur nach explizitem Klick und erzeugt eine durchsuchbare PDF
 - 🧭 **Vollbild-Viewer**: Navigation per Pfeiltasten, Outline-Anzeige mit Export-Buttons
 - 🔔 **Toasts**: Erfolgsmeldungen mit „Öffnen“-Button nach Export
 - 🧩 **Python-Bridge**: Split/Merge/Rotate/Compress/Outline via Python-Skripte
@@ -24,6 +25,7 @@ Pedefo ist eine lokale Electron-App zum schnellen Bearbeiten, Lesen und Extrahie
 - Node.js 18+
 - Python 3.9+
 - (Optional) Ghostscript für beste Kompression
+- (Optional) Tesseract OCR für durchsuchbare gescannte PDFs
 - Poppler ist im Repo gebundled (`electron-app/poppler/`)
 
 ## 🚀 Schnellstart
@@ -93,6 +95,10 @@ Output landet unter `dist/`.
 	- Installer ausführen (Standardpfad ist ok)
 	- Pedefo komplett schließen und neu starten
 	- Danach erneut komprimieren
+- **OCR nicht verfügbar**: Installiere Tesseract OCR, damit gescannte PDFs in durchsuchbare PDFs umgewandelt werden können.
+	- Tesseract herunterladen: https://github.com/UB-Mannheim/tesseract/wiki
+	- Deutsche Sprachdaten installieren (`deu`); ohne `deu` werden Umlaute in deutschen Texten unzuverlässig erkannt
+	- Pedefo komplett schließen und neu starten
 - **Outline leer**: PDF hat kein TOC oder Poppler/`utils.py` liefert keins; App zeigt Placeholder.
 
 ## 📜 Lizenz
