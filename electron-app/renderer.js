@@ -267,17 +267,10 @@ function positionSelectableTextLayer(layer, host, img) {
     }
 
     layer.style.display = 'block';
-    if (host.classList.contains('page-viewer-page-frame')) {
-        layer.style.left = '0px';
-        layer.style.top = '0px';
-        layer.style.width = `${hostRect.width}px`;
-        layer.style.height = `${hostRect.height}px`;
-    } else {
-        layer.style.left = `${imgRect.left - hostRect.left + (host.scrollLeft || 0)}px`;
-        layer.style.top = `${imgRect.top - hostRect.top + (host.scrollTop || 0)}px`;
-        layer.style.width = `${imgRect.width}px`;
-        layer.style.height = `${imgRect.height}px`;
-    }
+    layer.style.left = `${imgRect.left - hostRect.left + (host.scrollLeft || 0)}px`;
+    layer.style.top = `${imgRect.top - hostRect.top + (host.scrollTop || 0)}px`;
+    layer.style.width = `${imgRect.width}px`;
+    layer.style.height = `${imgRect.height}px`;
     return { width: imgRect.width, height: imgRect.height };
 }
 
