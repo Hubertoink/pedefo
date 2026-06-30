@@ -28,9 +28,9 @@ let pageIndexById = new Map();
 let renderPagesToken = 0;
 
 const gridVirtual = {
-    rowHeight: 240,
+    rowHeight: 300,
     overscanRows: 3,
-    pageWidth: 140,
+    pageWidth: 180,
     insertWidth: 40,
     gap: 8,
     inner: null,
@@ -118,6 +118,83 @@ async function getPdfPageCount(filePath) {
         const result = await window.pedefo.pdf.getPageCount(filePath);
         if (!result.success) throw new Error(result.message);
         return result.data.pages;
+    }
+}
+
+function normalizePageRotation(rotation = 0) {
+    return ((rotation % 360) + 360) % 360;
+}
+
+function getStoredPageDimensions(page) {
+    const width = Number(page?.sourceWidth) || 0;
+    const height = Number(page?.sourceHeight) || 0;
+    return (width > 0 && height > 0) ? { width, height } : null;
+}
+
+function getEffectivePageAspectRatio(page) {
+    const dimensions = getStoredPageDimensions(page);
+    if (!dimensions) return 210 / 297;
+
+    const rotation = normalizePageRotation(page?.rotation || 0);
+    const swapSides = rotation === 90 || rotation === 270;
+    const width = swapSides ? dimensions.height : dimensions.width;
+    const height = swapSides ? dimensions.width : dimensions.height;
+
+    if (width <= 0 || height <= 0) return 210 / 297;
+    return width / height;
+}
+
+function getPageAspectRatioCssValue(page) {
+    return getEffectivePageAspectRatio(page).toFixed(4);
+}
+
+function applyPageAspectRatioToCard(page) {
+    const thumbnail = document.querySelector(`[data-page-id="${page.id}"] .page-thumbnail`);
+    if (thumbnail) {
+        thumbnail.style.setProperty('--page-aspect-ratio', getPageAspectRatioCssValue(page));
+    }
+}
+
+function applyPageAspectRatioToReaderThumb(page) {
+    const index = state.pages.indexOf(page);
+    if (index === -1) return;
+
+    const img = document.querySelector(`.reader-thumb[data-index="${index}"] img`);
+    if (img) {
+        img.style.setProperty('--page-aspect-ratio', getPageAspectRatioCssValue(page));
+    }
+}
+
+function applyPageAspectRatioToUI(page) {
+    applyPageAspectRatioToCard(page);
+    applyPageAspectRatioToReaderThumb(page);
+}
+
+async function hydratePageMetrics(pages) {
+    const pendingPages = (pages || []).filter(page => !getStoredPageDimensions(page));
+    if (pendingPages.length === 0) return;
+
+    const bySource = new Map();
+    for (const page of pendingPages) {
+        if (!bySource.has(page.sourceFile)) {
+            bySource.set(page.sourceFile, []);
+        }
+        bySource.get(page.sourceFile).push(page);
+    }
+
+    for (const [sourceFile, sourcePages] of bySource.entries()) {
+        try {
+            const documentProxy = await getPdfDocument(sourceFile);
+            await Promise.all(sourcePages.map(async (page) => {
+                const pdfPage = await documentProxy.getPage(page.originalNumber);
+                const viewport = pdfPage.getViewport({ scale: 1 });
+                page.sourceWidth = viewport.width;
+                page.sourceHeight = viewport.height;
+                applyPageAspectRatioToUI(page);
+            }));
+        } catch (error) {
+            console.warn(`Page metrics could not be loaded for ${sourceFile}:`, error);
+        }
     }
 }
 
@@ -563,6 +640,92 @@ function showScreen(screenId) {
     updateFloatingButtons();
 }
 
+const updateState = {
+    available: false,
+    downloaded: false,
+    version: null,
+    checking: false
+};
+
+function setUpdateButtonState(nextState = {}) {
+    Object.assign(updateState, nextState);
+
+    const button = document.getElementById('btn-update');
+    const label = document.getElementById('btn-update-label');
+    if (!button || !label) return;
+
+    button.style.display = updateState.available || updateState.checking ? 'inline-flex' : 'none';
+    button.disabled = !!updateState.checking && !updateState.available;
+
+    if (updateState.downloaded) {
+        label.textContent = 'Update installieren';
+        button.title = updateState.version
+            ? `Version ${updateState.version} installieren`
+            : 'Update installieren';
+    } else if (updateState.available) {
+        label.textContent = updateState.version ? `Update ${updateState.version}` : 'Update verfügbar';
+        button.title = 'Update wird vorbereitet';
+    } else if (updateState.checking) {
+        label.textContent = 'Suche Update...';
+        button.title = 'Suche nach Updates';
+    }
+}
+
+function setupUpdater() {
+    const button = document.getElementById('btn-update');
+    if (!button || !window.pedefo?.updates) return;
+
+    button.addEventListener('click', async () => {
+        if (updateState.downloaded) {
+            await window.pedefo.updates.install();
+        } else {
+            setUpdateButtonState({ checking: true });
+            await window.pedefo.updates.check();
+        }
+    });
+
+    window.pedefo.updates.onStatus((payload = {}) => {
+        if (payload.status === 'checking') {
+            setUpdateButtonState({ checking: true });
+            return;
+        }
+
+        if (payload.status === 'available') {
+            setUpdateButtonState({
+                available: true,
+                downloaded: false,
+                version: payload.version || null,
+                checking: false
+            });
+            showToast(`Update ${payload.version || ''} verfügbar`.trim(), 'info');
+            return;
+        }
+
+        if (payload.status === 'downloaded') {
+            setUpdateButtonState({
+                available: true,
+                downloaded: true,
+                version: payload.version || updateState.version,
+                checking: false
+            });
+            showToast('Update ist bereit zur Installation', 'success');
+            return;
+        }
+
+        if (payload.status === 'not-available') {
+            setUpdateButtonState({ available: false, downloaded: false, checking: false });
+            return;
+        }
+
+        if (payload.status === 'error') {
+            setUpdateButtonState({ checking: false });
+            console.warn('Update check failed:', payload.message);
+        }
+    });
+
+    window.pedefo.updates.check().catch(() => {});
+}
+
 // ============================================
 // Modal Management
 // ============================================
@@ -701,6 +864,8 @@ async function loadPDF(filePath) {
                 originalNumber: i,
                 sourceFile: filePath,
                 rotation: 0,
+                sourceWidth: null,
+                sourceHeight: null,
                 thumbnail: null,
                 chapterTitle: ''
             });
@@ -713,6 +878,7 @@ async function loadPDF(filePath) {
         updateStatusBar();
         renderPages();
         showScreen('screen-editor');
+        hydratePageMetrics(state.pages).catch(() => {});
         
         // Generate thumbnails with PDF.js render queue
         generateThumbnailsWithPoppler(filePath);
@@ -1158,7 +1324,7 @@ function createPageCard(page, index) {
                 </svg>
             </div>
             ${chapterBadge}
-            <div class="page-thumbnail">${thumbnailContent}</div>
+            <div class="page-thumbnail" style="--page-aspect-ratio: ${getPageAspectRatioCssValue(page)}">${thumbnailContent}</div>
             <div class="page-actions">
                 <button class="page-action-btn action-rotate" data-action="rotate-left" title="Links drehen">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -1801,6 +1967,7 @@ function rotatePagesBy(pageIds, degrees) {
         const page = state.pages.find(p => p.id === id);
         if (page) {
             page.rotation = (page.rotation + degrees + 360) % 360;
+            applyPageAspectRatioToUI(page);
             
             // Update thumbnail rotation
             const img = document.querySelector(`[data-page-id="${id}"] .page-thumbnail img`);
@@ -2128,6 +2295,8 @@ async function insertPdfFilesAt(files, insertIndex) {
                     originalNumber: pageNumber,
                     sourceFile: filePath,
                     rotation: 0,
+                    sourceWidth: null,
+                    sourceHeight: null,
                     thumbnail: null,
                     chapterTitle: ''
                 });
@@ -2141,6 +2310,7 @@ async function insertPdfFilesAt(files, insertIndex) {
         renderPages();
         updateStatusBar();
         hideLoading();
+        hydratePageMetrics(newPages).catch(() => {});
         
         for (const source of insertedSources) {
             await generateThumbnailsForPages(source.filePath, safeInsertIndex, source.pageCount);
@@ -2618,6 +2788,7 @@ function renderReaderThumbnails() {
         const img = document.createElement('img');
         img.alt = `Seite ${index + 1}`;
         img.style.transform = `rotate(${page.rotation}deg)`;
+        img.style.setProperty('--page-aspect-ratio', getPageAspectRatioCssValue(page));
         img.style.background = '#f0f0f0';
         img.style.width = '100%';
         img.style.display = 'block';
@@ -4376,6 +4547,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setupPageGridDelegatedEvents();
     setupEditorFileDropZone();
     setupUnsavedModal();
+    setupUpdater();
     
     // Ensure page viewer lives at body level (avoids stacking context issues)
     const viewerModal = document.getElementById('page-viewer');

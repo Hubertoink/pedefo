@@ -51,6 +51,16 @@ contextBridge.exposeInMainWorld('pedefo', {
     archive: {
         createZip: (entries, outputPath) => ipcRenderer.invoke('archive:createZip', entries, outputPath)
     },
+
+    updates: {
+        check: () => ipcRenderer.invoke('update:check'),
+        install: () => ipcRenderer.invoke('update:install'),
+        onStatus: (callback) => {
+            const listener = (_event, payload) => callback(payload);
+            ipcRenderer.on('update:status', listener);
+            return () => ipcRenderer.removeListener('update:status', listener);
+        }
+    },
     
     // System
     system: {

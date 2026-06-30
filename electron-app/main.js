@@ -1,10 +1,12 @@
 const { app, BrowserWindow, ipcMain, dialog, Menu, shell } = require('electron');
+const { autoUpdater } = require('electron-updater');
 const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 
 let mainWindow;
 let forceClose = false;  // Flag um zu prüfen ob wir das Schließen erlauben
+let updateDownloaded = false;
 
 // Prüfe ob wir in Entwicklung oder Produktion sind
 const isDev = !app.isPackaged;
@@ -53,6 +55,12 @@ function createWindow() {
         mainWindow.webContents.openDevTools();
     }
 
+    mainWindow.webContents.once('did-finish-load', () => {
+        if (!isDev) {
+            autoUpdater.checkForUpdates().catch(() => {});
+        }
+    });
+
     // Abfangen des Schließen-Events für ungespeicherte Änderungen
     mainWindow.on('close', (e) => {
         if (forceClose) {
@@ -82,6 +90,47 @@ function createWindow() {
     });
 }
 
+function sendUpdateStatus(payload) {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('update:status', payload);
+    }
+}
+
+autoUpdater.autoDownload = true;
+autoUpdater.autoInstallOnAppQuit = true;
+
+autoUpdater.on('checking-for-update', () => {
+    sendUpdateStatus({ status: 'checking' });
+});
+
+autoUpdater.on('update-available', (info) => {
+    updateDownloaded = false;
+    sendUpdateStatus({
+        status: 'available',
+        version: info?.version || null
+    });
+});
+
+autoUpdater.on('update-not-available', () => {
+    updateDownloaded = false;
+    sendUpdateStatus({ status: 'not-available' });
+});
+
+autoUpdater.on('update-downloaded', (info) => {
+    updateDownloaded = true;
+    sendUpdateStatus({
+        status: 'downloaded',
+        version: info?.version || null
+    });
+});
+
+autoUpdater.on('error', (error) => {
+    sendUpdateStatus({
+        status: 'error',
+        message: error?.message || 'Update konnte nicht geprüft werden'
+    });
+});
+
 app.whenReady().then(() => {
     createWindow();
 
@@ -90,6 +139,28 @@ app.whenReady().then(() => {
             createWindow();
         }
     });
+});
+
+ipcMain.handle('update:check', async () => {
+    if (isDev) {
+        return { success: false, message: 'Updates sind nur in der installierten App aktiv' };
+    }
+
+    try {
+        const result = await autoUpdater.checkForUpdates();
+        return { success: true, data: result?.updateInfo || null };
+    } catch (error) {
+        return { success: false, message: error.message };
+    }
+});
+
+ipcMain.handle('update:install', async () => {
+    if (!updateDownloaded) {
+        return { success: false, message: 'Update ist noch nicht vollständig heruntergeladen' };
+    }
+
+    setImmediate(() => autoUpdater.quitAndInstall(false, true));
+    return { success: true };
 });
 
 app.on('window-all-closed', () => {
