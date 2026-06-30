@@ -28,7 +28,7 @@ let pageIndexById = new Map();
 let renderPagesToken = 0;
 
 const gridVirtual = {
-    rowHeight: 300,
+    rowHeight: 380,
     overscanRows: 3,
     pageWidth: 180,
     insertWidth: 40,
@@ -146,6 +146,17 @@ function getEffectivePageAspectRatio(page) {
 
 function getPageAspectRatioCssValue(page) {
     return getEffectivePageAspectRatio(page).toFixed(4);
+}
+
+function getPageImageCacheKey(page) {
+    return `${page.originalNumber}:${normalizePageRotation(page.rotation || 0)}`;
+}
+
+function getPageThumbnailHeight(page) {
+    const ratio = getEffectivePageAspectRatio(page);
+    const width = gridVirtual.pageWidth;
+    const naturalHeight = ratio > 0 ? width / ratio : width * (297 / 210);
+    return Math.max(112, Math.ceil(naturalHeight));
 }
 
 function applyPageAspectRatioToCard(page) {
@@ -424,7 +435,8 @@ function clearRenderedImages() {
 
 function getPageRenderKey(page, variant, maxWidth, maxHeight) {
     const sharedVariant = (variant === 'grid' || variant === 'reader-thumb') ? 'thumb' : variant;
-    return `${page.sourceFile}|${page.originalNumber}|${sharedVariant}|${maxWidth}|${maxHeight || 0}`;
+    const rotation = normalizePageRotation(page.rotation || 0);
+    return `${page.sourceFile}|${page.originalNumber}|${rotation}|${sharedVariant}|${maxWidth}|${maxHeight || 0}`;
 }
 
 function schedulePdfPageRender(page, options = {}) {
@@ -476,11 +488,12 @@ function pumpPdfRenderQueue() {
 async function renderPdfPageToObjectUrl(page, maxWidth, maxHeight) {
     const documentProxy = await getPdfDocument(page.sourceFile);
     const pdfPage = await documentProxy.getPage(page.originalNumber);
-    const baseViewport = pdfPage.getViewport({ scale: 1 });
+    const rotation = normalizePageRotation(page.rotation || 0);
+    const baseViewport = pdfPage.getViewport({ scale: 1, rotation });
     const widthScale = maxWidth / baseViewport.width;
     const heightScale = maxHeight ? maxHeight / baseViewport.height : widthScale;
     const scale = Math.max(0.1, Math.min(widthScale, heightScale, 2.5));
-    const viewport = pdfPage.getViewport({ scale });
+    const viewport = pdfPage.getViewport({ scale, rotation });
 
     const canvas = document.createElement('canvas');
     const context = canvas.getContext('2d', { alpha: false });
@@ -1108,7 +1121,7 @@ async function loadGridThumbnail(page, dpi, totalPages) {
         // Update thumbnail in DOM sofort
         const pageEl = document.querySelector(`[data-page-id="${page.id}"] .page-thumbnail`);
         if (pageEl) {
-            pageEl.innerHTML = `<img src="${url}" alt="Seite ${page.number}" style="transform: rotate(${page.rotation}deg)">`;
+            pageEl.innerHTML = `<img src="${url}" alt="Seite ${page.number}">`;
         }
 
         // Fortschritt aktualisieren
@@ -1131,7 +1144,7 @@ async function loadGridThumbnailBatch(sourceFile, pageNumbers, pages, dpi, total
             page.thumbnail = url;
             const pageEl = document.querySelector(`[data-page-id="${page.id}"] .page-thumbnail`);
             if (pageEl) {
-                pageEl.innerHTML = `<img src="${url}" alt="Seite ${page.number}" style="transform: rotate(${page.rotation}deg)">`;
+                pageEl.innerHTML = `<img src="${url}" alt="Seite ${page.number}">`;
             }
         }));
 
@@ -1229,10 +1242,15 @@ function renderVirtualPageRows() {
         rowEl.style.transform = `translateY(${row * gridVirtual.rowHeight}px)`;
         rowEl.dataset.row = row;
 
-        rowEl.appendChild(createInsertZone(startIndex));
+        rowEl.appendChild(createInsertZone(startIndex, {
+            nextPage: state.pages[startIndex]
+        }));
         for (let index = startIndex; index < endIndex; index++) {
             rowEl.appendChild(createPageCard(state.pages[index], index));
-            rowEl.appendChild(createInsertZone(index + 1));
+            rowEl.appendChild(createInsertZone(index + 1, {
+                previousPage: state.pages[index],
+                nextPage: index + 1 < endIndex ? state.pages[index + 1] : null
+            }));
         }
         fragment.appendChild(rowEl);
     }
@@ -1309,7 +1327,7 @@ function createPageCard(page, index) {
     card.draggable = true;
     
     const thumbnailContent = page.thumbnail 
-        ? `<img src="${page.thumbnail}" alt="Seite ${index + 1}" style="transform: rotate(${page.rotation}deg)">`
+        ? `<img src="${page.thumbnail}" alt="Seite ${index + 1}">`
         : index + 1;
     const chapterTitle = getChapterTitle(page);
     const chapterBadge = chapterTitle
@@ -1363,11 +1381,16 @@ function createPageCard(page, index) {
     return card;
 }
 
-function createInsertZone(insertIndex) {
+function createInsertZone(insertIndex, context = {}) {
     const chapterMarker = gridChapterMarkersByInsertIndex.get(insertIndex);
     const zone = document.createElement('div');
     zone.className = 'insert-zone' + (chapterMarker ? ' chapter-start' : '');
     zone.dataset.insertIndex = insertIndex;
+    const adjacentHeights = [context.previousPage, context.nextPage]
+        .filter(Boolean)
+        .map(page => getPageThumbnailHeight(page));
+    const zoneHeight = adjacentHeights.length > 0 ? Math.max(...adjacentHeights) : 112;
+    zone.style.setProperty('--insert-zone-height', `${zoneHeight}px`);
     const chapterMarkerHtml = chapterMarker ? `
         <div class="grid-chapter-marker" data-source-file="${escapeHtml(chapterMarker.sourceFile)}" data-start-page="${chapterMarker.startPage}" data-end-page="${chapterMarker.endPage || ''}" data-title="${escapeHtml(chapterMarker.title)}" data-target-index="${chapterMarker.targetIndex}">
             <span class="grid-chapter-rail"></span>
@@ -1963,20 +1986,30 @@ function removeChapterFromModal() {
 }
 
 function rotatePagesBy(pageIds, degrees) {
+    const rotatedPages = [];
     pageIds.forEach(id => {
         const page = state.pages.find(p => p.id === id);
         if (page) {
             page.rotation = (page.rotation + degrees + 360) % 360;
-            applyPageAspectRatioToUI(page);
-            
-            // Update thumbnail rotation
-            const img = document.querySelector(`[data-page-id="${id}"] .page-thumbnail img`);
-            if (img) {
-                img.style.transform = `rotate(${page.rotation}deg)`;
+            page.thumbnail = null;
+            if (readerHighResThumbnails[page.sourceFile]) {
+                readerHighResThumbnails[page.sourceFile] = {};
             }
+            if (viewerHighResThumbnails[page.sourceFile]) {
+                viewerHighResThumbnails[page.sourceFile] = {};
+            }
+            rotatedPages.push(page);
+            applyPageAspectRatioToUI(page);
         }
     });
     state.isDirty = true;
+    if (rotatedPages.length > 0) {
+        renderPages();
+        scheduleGridThumbnailLoad();
+        if (document.getElementById('screen-reader')?.classList.contains('active')) {
+            renderReaderThumbnails();
+        }
+    }
     showToast(`${pageIds.length} Seite(n) rotiert`, 'success');
 }
 
@@ -2787,7 +2820,6 @@ function renderReaderThumbnails() {
         thumb.dataset.index = index;
         const img = document.createElement('img');
         img.alt = `Seite ${index + 1}`;
-        img.style.transform = `rotate(${page.rotation}deg)`;
         img.style.setProperty('--page-aspect-ratio', getPageAspectRatioCssValue(page));
         img.style.background = '#f0f0f0';
         img.style.width = '100%';
@@ -2991,7 +3023,7 @@ async function loadReaderThumbnail(page, dpi) {
                 thumbWrapper.appendChild(numberBadge);
             }
             imgEl.src = url;
-            imgEl.style.transform = `rotate(${page.rotation}deg)`;
+            imgEl.style.setProperty('--page-aspect-ratio', getPageAspectRatioCssValue(page));
             imgEl.alt = `Seite ${idx + 1}`;
         }
     } catch (error) {
@@ -3022,7 +3054,7 @@ async function loadReaderThumbnailBatch(sourceFile, pageNumbers, items, dpi) {
                     thumbWrapper.appendChild(numberBadge);
                 }
                 imgEl.src = url;
-                imgEl.style.transform = `rotate(${page.rotation}deg)`;
+                imgEl.style.setProperty('--page-aspect-ratio', getPageAspectRatioCssValue(page));
                 imgEl.alt = `Seite ${idx + 1}`;
             }
         }));
@@ -3458,7 +3490,8 @@ function createReaderInsertZone(insertIndex) {
 async function loadSingleHighResThumbnail(page, navToken = null) {
     // Prüfe ob bereits im Cache
     const cache = readerHighResThumbnails[page.sourceFile];
-    if (cache && cache[page.originalNumber]) return;
+    const cacheKey = getPageImageCacheKey(page);
+    if (cache && cache[cacheKey]) return;
     
     // Ermittle DPI basierend auf Gesamtseitenzahl der Quelle
     let dpi = 100;
@@ -3486,7 +3519,7 @@ async function loadSingleHighResThumbnail(page, navToken = null) {
         if (!readerHighResThumbnails[page.sourceFile]) {
             readerHighResThumbnails[page.sourceFile] = {};
         }
-        readerHighResThumbnails[page.sourceFile][page.originalNumber] = url;
+        readerHighResThumbnails[page.sourceFile][cacheKey] = url;
         
         // Anzeige nur aktualisieren, wenn diese Seite noch aktiv ist (check by id)
         const currentPage = state.pages[readerCurrentPage];
@@ -3572,7 +3605,7 @@ function showReaderPage(index) {
     
     // Hole High-Res basierend auf sourceFile und originalNumber
     const highResCache = readerHighResThumbnails[page.sourceFile];
-    const highRes = highResCache ? highResCache[page.originalNumber] : null;
+    const highRes = highResCache ? highResCache[getPageImageCacheKey(page)] : null;
     const thumbnail = highRes || page.thumbnail;
 
     if (thumbnail) {
@@ -3584,7 +3617,6 @@ function showReaderPage(index) {
         img.style.display = 'block';
         loadSingleMediumResThumbnail(page, myToken);
     }
-    img.style.transform = `rotate(${page.rotation}deg)`;
     renderSelectableTextLayer('reader', page);
     
     // Seiteninformation aktualisieren
@@ -3623,7 +3655,7 @@ async function loadPriorityThumbnails(centerIndex, token) {
     
     // Prüfe ob aktuelle Seite bereits High-Res hat
     const cache = readerHighResThumbnails[page.sourceFile];
-    const hasHighRes = cache && cache[page.originalNumber];
+    const hasHighRes = cache && cache[getPageImageCacheKey(page)];
 
     // High-res für aktuelle Seite im Hintergrund (nicht blockierend)
     if (!hasHighRes) {
@@ -3649,7 +3681,7 @@ async function loadPriorityThumbnails(centerIndex, token) {
         const promises = chunk.map(idx => {
             const nearPage = state.pages[idx];
             const nearCache = readerHighResThumbnails[nearPage.sourceFile];
-            if (!nearCache || !nearCache[nearPage.originalNumber]) {
+            if (!nearCache || !nearCache[getPageImageCacheKey(nearPage)]) {
                 return loadSingleHighResThumbnail(nearPage, token);
             }
             return Promise.resolve();
@@ -3782,7 +3814,7 @@ function showViewerPage(index) {
     // Update image
     const img = document.getElementById('viewer-page-image');
     const highResCache = viewerHighResThumbnails[page.sourceFile];
-    const highRes = highResCache ? highResCache[page.originalNumber] : null;
+    const highRes = highResCache ? highResCache[getPageImageCacheKey(page)] : null;
     const thumbnail = highRes || page.thumbnail;
     
     if (thumbnail) {
@@ -3792,7 +3824,6 @@ function showViewerPage(index) {
         img.src = '';
         img.style.display = 'block';
     }
-    img.style.transform = `rotate(${page.rotation}deg)`;
     applyViewerZoom(false);
     renderSelectableTextLayer('viewer', page);
     
@@ -3817,7 +3848,7 @@ async function loadViewerThumbnails(centerIndex) {
     
     // Check if current page has high-res
     const cache = viewerHighResThumbnails[page.sourceFile];
-    const hasHighRes = cache && cache[page.originalNumber];
+    const hasHighRes = cache && cache[getPageImageCacheKey(page)];
     
     if (!hasHighRes) {
         // Show loading
@@ -3845,7 +3876,7 @@ async function loadViewerThumbnails(centerIndex) {
         const promises = chunk.map(idx => {
             const nearPage = state.pages[idx];
             const nearCache = viewerHighResThumbnails[nearPage.sourceFile];
-            if (!nearCache || !nearCache[nearPage.originalNumber]) {
+            if (!nearCache || !nearCache[getPageImageCacheKey(nearPage)]) {
                 return loadSingleViewerThumbnail(nearPage);
             }
             return Promise.resolve();
@@ -3857,7 +3888,8 @@ async function loadViewerThumbnails(centerIndex) {
 async function loadSingleViewerThumbnail(page) {
     // Check if already in cache
     const cache = viewerHighResThumbnails[page.sourceFile];
-    if (cache && cache[page.originalNumber]) return;
+    const cacheKey = getPageImageCacheKey(page);
+    if (cache && cache[cacheKey]) return;
     
     // Determine DPI based on total pages
     let dpi = 100;
@@ -3882,7 +3914,7 @@ async function loadSingleViewerThumbnail(page) {
         if (!viewerHighResThumbnails[page.sourceFile]) {
             viewerHighResThumbnails[page.sourceFile] = {};
         }
-        viewerHighResThumbnails[page.sourceFile][page.originalNumber] = url;
+        viewerHighResThumbnails[page.sourceFile][cacheKey] = url;
         
         // Update display if this is the current page
         const currentPage = state.pages[viewerCurrentPage];
