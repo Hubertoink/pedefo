@@ -28,7 +28,9 @@ let pageIndexById = new Map();
 let renderPagesToken = 0;
 
 const gridVirtual = {
-    rowHeight: 380,
+    rowOffsets: [0],
+    rowGap: 28,
+    layoutKey: null,
     overscanRows: 3,
     pageWidth: 180,
     insertWidth: 40,
@@ -48,7 +50,7 @@ const pdfRender = {
     objectUrls: new Set(),
     queue: [],
     active: 0,
-    maxConcurrent: 2,
+    maxConcurrent: 4,
     loadToken: 0
 };
 
@@ -97,17 +99,22 @@ async function getPdfDocument(filePath) {
         return pdfRender.documents.get(filePath);
     }
 
-    const pdfjs = await ensurePdfJs();
-    const binary = await window.pedefo.file.readBinary(filePath);
-    const data = normalizeBinaryData(binary);
-    const task = pdfjs.getDocument({
-        data,
-        isEvalSupported: false,
-        useSystemFonts: true
-    });
-    const documentProxy = await task.promise;
-    pdfRender.documents.set(filePath, documentProxy);
-    return documentProxy;
+    const pending = (async () => {
+        const pdfjs = await ensurePdfJs();
+        const binary = await window.pedefo.file.readBinary(filePath);
+        return pdfjs.getDocument({
+            data: normalizeBinaryData(binary),
+            isEvalSupported: false,
+            useSystemFonts: true
+        }).promise;
+    })();
+    pdfRender.documents.set(filePath, pending);
+    try {
+        return await pending;
+    } catch (error) {
+        pdfRender.documents.delete(filePath);
+        throw error;
+    }
 }
 
 async function getPdfPageCount(filePath) {
@@ -197,13 +204,17 @@ async function hydratePageMetrics(pages) {
     for (const [sourceFile, sourcePages] of bySource.entries()) {
         try {
             const documentProxy = await getPdfDocument(sourceFile);
-            await Promise.all(sourcePages.map(async (page) => {
-                const pdfPage = await documentProxy.getPage(page.originalNumber);
-                const viewport = pdfPage.getViewport({ scale: 1 });
-                page.sourceWidth = viewport.width;
-                page.sourceHeight = viewport.height;
-                applyPageAspectRatioToUI(page);
-            }));
+            for (let offset = 0; offset < sourcePages.length; offset += 16) {
+                await Promise.all(sourcePages.slice(offset, offset + 16).map(async (page) => {
+                    const pdfPage = await documentProxy.getPage(page.originalNumber);
+                    const viewport = pdfPage.getViewport({ scale: 1 });
+                    page.sourceWidth = viewport.width;
+                    page.sourceHeight = viewport.height;
+                    applyPageAspectRatioToUI(page);
+                }));
+                scheduleVirtualPageRender(true);
+                await new Promise(resolve => setTimeout(resolve, 0));
+            }
         } catch (error) {
             console.warn(`Page metrics could not be loaded for ${sourceFile}:`, error);
         }
@@ -455,7 +466,7 @@ function schedulePdfPageRender(page, options = {}) {
     }
 
     const promise = new Promise((resolve, reject) => {
-        pdfRender.queue.push({ page, variant, maxWidth, maxHeight, priority, key, resolve, reject });
+        pdfRender.queue.push({ page: { ...page }, variant, maxWidth, maxHeight, priority, key, resolve, reject });
         pdfRender.queue.sort((a, b) => b.priority - a.priority);
         pumpPdfRenderQueue();
     });
@@ -650,7 +661,9 @@ function showScreen(screenId) {
     document.getElementById('toolbar').style.display = showControls ? 'flex' : 'none';
     document.getElementById('btn-save').style.display = showControls ? 'flex' : 'none';
     document.getElementById('btn-new').style.display = showControls ? 'block' : 'none';
-    document.getElementById('status-bar').style.display = isEditor ? 'flex' : 'none';
+    document.getElementById('status-bar').style.display = 'flex';
+    document.getElementById('status-pages').hidden = !showControls;
+    document.getElementById('status-selected').hidden = !showControls;
     updateFloatingButtons();
 }
 
@@ -985,21 +998,18 @@ function loadVisibleThumbnails() {
     const visiblePages = getVisiblePagesInGrid();
     if (visiblePages.length === 0) return;
 
-    // Prioritize pages around current focus (or center of visible range)
-    let focusIndex = (state.lastFocusedPageId && pageIndexById.has(state.lastFocusedPageId))
-        ? pageIndexById.get(state.lastFocusedPageId)
-        : null;
-    if (focusIndex === null) {
-        const mid = visiblePages[Math.floor(visiblePages.length / 2)];
-        focusIndex = mid?.index ?? 0;
+    const container = document.getElementById('pages-container');
+    const bounds = container.getBoundingClientRect();
+    const visibleIds = new Set(Array.from(container.querySelectorAll('.page-card'))
+        .filter(card => {
+            const rect = card.getBoundingClientRect();
+            return rect.bottom > bounds.top && rect.top < bounds.bottom;
+        }).map(card => card.dataset.pageId));
+    visiblePages.sort((a, b) => Number(visibleIds.has(b.id)) - Number(visibleIds.has(a.id)) || a.index - b.index);
+    for (const job of pdfRender.queue) {
+        if (job.variant === 'grid') job.priority = visibleIds.has(job.page.id) ? 50 : 5;
     }
-
-    visiblePages.sort((a, b) => {
-        const da = Math.abs(a.index - focusIndex);
-        const db = Math.abs(b.index - focusIndex);
-        if (da !== db) return da - db;
-        return a.index - b.index;
-    });
+    pdfRender.queue.sort((a, b) => b.priority - a.priority);
 
     // Collect pages to load in batch (up to 16 at once)
     const toLoad = [];
@@ -1028,7 +1038,7 @@ function loadVisibleThumbnails() {
     // Load each source as a batch
     for (const [sourceFile, { cfg, pages }] of Object.entries(bySource)) {
         const pageNumbers = pages.map(p => p.originalNumber);
-        loadGridThumbnailBatch(sourceFile, pageNumbers, pages, cfg.dpi, cfg.total)
+        loadGridThumbnailBatch(sourceFile, pageNumbers, pages, cfg.dpi, cfg.total, visibleIds)
             .finally(() => pages.forEach(p => gridThumbLoading.delete(p.id)));
     }
 }
@@ -1037,8 +1047,8 @@ function getVisiblePagesInGrid() {
     const container = document.getElementById('pages-container');
     if (!container) return [];
 
-    // Fast path: IntersectionObserver maintains a set of visible page ids
-    if (gridThumbObserver) {
+    // Use geometry immediately until the observer has reported its first entries.
+    if (gridThumbObserver && gridVisiblePageIds.size > 0) {
         const out = [];
         for (const id of gridVisiblePageIds) {
             const idx = pageIndexById.get(id);
@@ -1166,16 +1176,21 @@ async function loadGridThumbnail(page, dpi, totalPages) {
     }
 }
 
-async function loadGridThumbnailBatch(sourceFile, pageNumbers, pages, dpi, totalPages) {
+async function loadGridThumbnailBatch(sourceFile, pageNumbers, pages, dpi, totalPages, visibleIds = new Set()) {
     try {
-        await Promise.all(pages.map(async (page, index) => {
+        await Promise.all(pages.map(async (page) => {
+            const rotation = page.rotation;
             const url = await schedulePdfPageRender(page, {
                 variant: 'grid',
                 maxWidth: dpi >= 72 ? 360 : 240,
-                priority: 30 - index
+                maxHeight: 340,
+                priority: visibleIds.has(page.id) ? 50 : 5
             });
 
+            if (page.rotation !== rotation) return;
             page.thumbnail = url;
+            gridThumbLoading.delete(page.id);
+            scheduleGridThumbnailLoad();
             const pageEl = document.querySelector(`[data-page-id="${page.id}"] .page-thumbnail`);
             if (pageEl) {
                 pageEl.innerHTML = `<img src="${url}" alt="Seite ${page.number}">`;
@@ -1234,7 +1249,8 @@ function attachGridVirtualHandlers(container) {
 }
 
 function scheduleVirtualPageRender(force = false) {
-    if (gridVirtual.renderScheduled && !force) return;
+    if (force === true) gridVirtual.layoutKey = null;
+    if (gridVirtual.renderScheduled) return;
     gridVirtual.renderScheduled = true;
     requestAnimationFrame(() => {
         gridVirtual.renderScheduled = false;
@@ -1252,7 +1268,14 @@ function renderVirtualPageRows() {
     gridVirtual.pagesPerRow = pagesPerRow;
 
     const rowCount = Math.ceil(total / pagesPerRow);
-    inner.style.height = `${rowCount * gridVirtual.rowHeight}px`;
+    const offsets = [0];
+    for (let row = 0; row < rowCount; row++) {
+        const pages = state.pages.slice(row * pagesPerRow, (row + 1) * pagesPerRow);
+        const height = Math.max(...pages.map(getPageThumbnailHeight)) + 32 + gridVirtual.rowGap;
+        offsets.push(offsets[row] + height);
+    }
+    gridVirtual.rowOffsets = offsets;
+    inner.style.height = `${offsets[rowCount]}px`;
     rebuildGridChapterMarkers();
 
     if (total === 0) {
@@ -1260,11 +1283,15 @@ function renderVirtualPageRows() {
         return;
     }
 
-    const firstRow = Math.max(0, Math.floor(container.scrollTop / gridVirtual.rowHeight) - gridVirtual.overscanRows);
-    const lastRow = Math.min(
-        rowCount - 1,
-        Math.ceil((container.scrollTop + container.clientHeight) / gridVirtual.rowHeight) + gridVirtual.overscanRows
-    );
+    let firstVisible = 0;
+    while (firstVisible < rowCount - 1 && offsets[firstVisible + 1] <= container.scrollTop) firstVisible++;
+    let lastVisible = firstVisible;
+    while (lastVisible < rowCount - 1 && offsets[lastVisible + 1] < container.scrollTop + container.clientHeight) lastVisible++;
+    const firstRow = Math.max(0, firstVisible - gridVirtual.overscanRows);
+    const lastRow = Math.min(rowCount - 1, lastVisible + gridVirtual.overscanRows);
+    const layoutKey = `${renderPagesToken}:${pagesPerRow}:${firstRow}:${lastRow}:${offsets.join(',')}`;
+    if (gridVirtual.layoutKey === layoutKey) return;
+    gridVirtual.layoutKey = layoutKey;
 
     const fragment = document.createDocumentFragment();
     for (let row = firstRow; row <= lastRow; row++) {
@@ -1273,7 +1300,8 @@ function renderVirtualPageRows() {
         const endIndex = Math.min(total, startIndex + pagesPerRow);
         const rowEl = document.createElement('div');
         rowEl.className = 'pages-virtual-row';
-        rowEl.style.transform = `translateY(${row * gridVirtual.rowHeight}px)`;
+        rowEl.style.transform = `translateY(${offsets[row]}px)`;
+        rowEl.style.height = `${offsets[row + 1] - offsets[row]}px`;
         rowEl.dataset.row = row;
 
         rowEl.appendChild(createInsertZone(startIndex, {
@@ -1346,10 +1374,12 @@ function renderPages() {
     inner.className = 'pages-virtual-spacer';
     container.appendChild(inner);
     gridVirtual.inner = inner;
-    container.scrollTop = Math.min(previousScrollTop, Math.max(0, state.pages.length * gridVirtual.rowHeight));
+    gridVirtual.layoutKey = null;
 
     attachGridVirtualHandlers(container);
     renderVirtualPageRows();
+    container.scrollTop = previousScrollTop;
+    scheduleVirtualPageRender();
     updateSelectionBar();
     renderSplitPanel();
 }
@@ -1682,7 +1712,7 @@ function focusGridPage(index) {
         if (container?.classList.contains('virtualized')) {
             const pagesPerRow = Math.max(1, gridVirtual.pagesPerRow || getGridPagesPerRow(container));
             const targetRow = Math.floor(index / pagesPerRow);
-            container.scrollTo({ top: targetRow * gridVirtual.rowHeight, behavior: 'smooth' });
+            container.scrollTo({ top: gridVirtual.rowOffsets[targetRow] || 0, behavior: 'smooth' });
             scheduleVirtualPageRender(true);
         }
 
