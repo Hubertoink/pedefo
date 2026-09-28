@@ -683,7 +683,6 @@ body {
 .page-thumbnail {
     width: 100%;
     aspect-ratio: var(--page-aspect-ratio, 210 / 297);
-    min-height: 112px;
     display: flex;
     align-items: center;
     justify-content: center;
@@ -1206,7 +1205,7 @@ body {
     border-top: 1px solid var(--border-color);
     display: flex;
     align-items: center;
-    justify-content: space-between;
+    gap: 16px;
     padding: 0 16px;
     font-size: 12px;
     color: var(--text-muted);
@@ -3080,4 +3079,25 @@ body {
     .btn-fullscreen-view {
         right: 20px;
     }
+}
+
+.status-version {
+    margin-left: auto;
+    padding: 3px 8px;
+    border: 0;
+    border-radius: 4px;
+    background: transparent;
+    color: inherit;
+    font: inherit;
+    cursor: pointer;
+}
+
+.status-version:hover, .status-version:focus-visible {
+    color: var(--accent);
+    background: var(--accent-light);
+}
+
+.status-version:disabled {
+    opacity: 0.6;
+    cursor: progress;
 }

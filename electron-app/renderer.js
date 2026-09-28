@@ -156,13 +156,14 @@ function getPageThumbnailHeight(page) {
     const ratio = getEffectivePageAspectRatio(page);
     const width = gridVirtual.pageWidth;
     const naturalHeight = ratio > 0 ? width / ratio : width * (297 / 210);
-    return Math.max(112, Math.ceil(naturalHeight));
+    return Math.min(255, Math.ceil(naturalHeight));
 }
 
 function applyPageAspectRatioToCard(page) {
     const thumbnail = document.querySelector(`[data-page-id="${page.id}"] .page-thumbnail`);
     if (thumbnail) {
         thumbnail.style.setProperty('--page-aspect-ratio', getPageAspectRatioCssValue(page));
+        thumbnail.parentElement.style.width = `${Math.min(gridVirtual.pageWidth, 255 * getEffectivePageAspectRatio(page))}px`;
     }
 }
 
@@ -388,7 +389,7 @@ async function renderSelectableTextLayer(target, page) {
         const pdfPage = await documentProxy.getPage(page.originalNumber);
         if (textLayerTokens[target] !== token) return;
 
-        const rotation = ((page.rotation || 0) % 360 + 360) % 360;
+        const rotation = normalizePageRotation((pdfPage.rotate || 0) + (page.rotation || 0));
         const baseViewport = pdfPage.getViewport({ scale: 1, rotation });
         const widthScale = bounds.width / baseViewport.width;
         const heightScale = bounds.height / baseViewport.height;
@@ -488,7 +489,7 @@ function pumpPdfRenderQueue() {
 async function renderPdfPageToObjectUrl(page, maxWidth, maxHeight) {
     const documentProxy = await getPdfDocument(page.sourceFile);
     const pdfPage = await documentProxy.getPage(page.originalNumber);
-    const rotation = normalizePageRotation(page.rotation || 0);
+    const rotation = normalizePageRotation((pdfPage.rotate || 0) + (page.rotation || 0));
     const baseViewport = pdfPage.getViewport({ scale: 1, rotation });
     const widthScale = maxWidth / baseViewport.width;
     const heightScale = maxHeight ? maxHeight / baseViewport.height : widthScale;
@@ -657,12 +658,19 @@ const updateState = {
     available: false,
     downloaded: false,
     version: null,
-    checking: false
+    checking: false,
+    manualCheck: false
 };
 
 function setUpdateButtonState(nextState = {}) {
     Object.assign(updateState, nextState);
 
+    const versionButton = document.getElementById('btn-version');
+    if (versionButton) {
+        versionButton.disabled = updateState.checking;
+        versionButton.setAttribute('aria-busy', String(updateState.checking));
+        versionButton.title = updateState.checking ? 'Suche nach Updates...' : 'Nach Updates suchen';
+    }
     const button = document.getElementById('btn-update');
     const label = document.getElementById('btn-update-label');
     if (!button || !label) return;
@@ -688,12 +696,33 @@ function setupUpdater() {
     const button = document.getElementById('btn-update');
     if (!button || !window.pedefo?.updates) return;
 
+    const versionButton = document.getElementById('btn-version');
+    window.pedefo.updates.getVersion().then(version => {
+        versionButton.textContent = `v${version}`;
+        versionButton.setAttribute('aria-label', `Version ${version}: Nach Updates suchen`);
+    }).catch(console.warn);
+
+    async function checkForUpdates(manual = false) {
+        if (updateState.checking) return;
+        setUpdateButtonState({ checking: true, manualCheck: manual });
+        try {
+            const result = await window.pedefo.updates.check();
+            if (!result.success && updateState.manualCheck) {
+                showToast(result.message || 'Update-Suche fehlgeschlagen', 'info');
+            }
+        } catch (error) {
+            if (updateState.manualCheck) showToast('Update-Suche fehlgeschlagen', 'error');
+        } finally {
+            setUpdateButtonState({ checking: false, manualCheck: false });
+        }
+    }
+
+    versionButton.addEventListener('click', () => checkForUpdates(true));
     button.addEventListener('click', async () => {
         if (updateState.downloaded) {
             await window.pedefo.updates.install();
         } else {
-            setUpdateButtonState({ checking: true });
-            await window.pedefo.updates.check();
+            await checkForUpdates(true);
         }
     });
 
@@ -726,17 +755,22 @@ function setupUpdater() {
         }
 
         if (payload.status === 'not-available') {
+            if (updateState.manualCheck) showToast('Pedefo ist auf dem neuesten Stand', 'success');
             setUpdateButtonState({ available: false, downloaded: false, checking: false });
             return;
         }
 
         if (payload.status === 'error') {
             setUpdateButtonState({ checking: false });
+            if (updateState.manualCheck) {
+                showToast('Update-Suche fehlgeschlagen. Bitte später erneut versuchen.', 'error');
+                updateState.manualCheck = false;
+            }
             console.warn('Update check failed:', payload.message);
         }
     });
 
-    window.pedefo.updates.check().catch(() => {});
+    checkForUpdates();
 }
 
 // ============================================
@@ -1335,7 +1369,7 @@ function createPageCard(page, index) {
         : '';
     
     card.innerHTML = `
-        <div class="page-thumbnail-wrapper">
+        <div class="page-thumbnail-wrapper" style="width: ${Math.min(gridVirtual.pageWidth, 255 * getEffectivePageAspectRatio(page))}px">
             <div class="page-checkbox ${state.selectedPages.has(page.id) ? 'visible' : ''}">
                 <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="3">
                     <polyline points="20 6 9 17 4 12"/>

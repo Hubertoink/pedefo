@@ -53,6 +53,7 @@ contextBridge.exposeInMainWorld('pedefo', {
     },
 
     updates: {
+        getVersion: () => ipcRenderer.invoke('app:version'),
         check: () => ipcRenderer.invoke('update:check'),
         install: () => ipcRenderer.invoke('update:install'),
         onStatus: (callback) => {

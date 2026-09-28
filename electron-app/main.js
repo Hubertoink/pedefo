@@ -55,12 +55,6 @@ function createWindow() {
         mainWindow.webContents.openDevTools();
     }
 
-    mainWindow.webContents.once('did-finish-load', () => {
-        if (!isDev) {
-            autoUpdater.checkForUpdates().catch(() => {});
-        }
-    });
-
     // Abfangen des Schließen-Events für ungespeicherte Änderungen
     mainWindow.on('close', (e) => {
         if (forceClose) {
@@ -140,6 +134,8 @@ app.whenReady().then(() => {
         }
     });
 });
+
+ipcMain.handle('app:version', () => app.getVersion());
 
 ipcMain.handle('update:check', async () => {
     if (isDev) {

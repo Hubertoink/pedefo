@@ -109,3 +109,9 @@ MIT License
 
 Made with ❤️ for local, fast PDF work.
 npm run build:win
+
+## Version 1.0.2
+
+- Klick auf die Versionsnummer unten rechts startet die Update-Suche mit Statusmeldung.
+- Vorschauen beachten Hochformat, Querformat und die im PDF gespeicherte Drehung.
+- Besonders hohe Seiten bleiben vollständig innerhalb der Vorschau sichtbar.
