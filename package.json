@@ -1,6 +1,6 @@
 {
   "name": "pedefo",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Lightweight lokale PDF-App - Zusammenführen, Aufteilen, Komprimieren",
   "main": "electron-app/main.js",
   "scripts": {
